@@ -2,7 +2,7 @@
 set -e
 
 echo "=================================================="
-echo "   NORWEGIAN QWEN3-TTS FINETUNER (FINAL V3)       "
+echo "   NORWEGIAN QWEN3-TTS FINETUNER (FINAL V4)       "
 echo "=================================================="
 
 # 1. Klon Qwen3-TTS repoet
@@ -13,7 +13,7 @@ else
     echo "[1/6] Qwen3-TTS repo finnes allerede."
 fi
 
-# 2. Last ned basismodellen lokalt (FIX for shutil.copytree bug)
+# 2. Last ned BASIS-modellen lokalt (for å unngå krasj etter trening)
 echo "[2/6] Laster ned basismodell til disk..."
 if [ ! -d "/workspace/base_model" ]; then
     huggingface-cli download \
@@ -32,11 +32,12 @@ echo "[3/6] Bygger datasett fra NPSC..."
 python /workspace/src/data_npsc.py
 
 # 4. Preprosesser data (Audio -> Codes)
+# VIKTIG ENDRING HER: Vi peker tilbake til Tokenizer-repoet på HF!
 echo "[4/6] Ekstraherer audio codes (Tokenizing)..."
 python prepare_data.py \
     --input_jsonl /workspace/data/train.jsonl \
     --output_jsonl /workspace/data/train_with_codes.jsonl \
-    --tokenizer_model_path /workspace/base_model \
+    --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
     --device cuda:0
 
 # --- FIXES FOR QWEN TRAINING SCRIPT ---
@@ -51,7 +52,8 @@ sed -i 's/log_with="tensorboard"/log_with="tensorboard", project_dir=args.output
 # Fix 3: Bruk SDPA istedenfor Flash Attention 2
 sed -i 's/attn_implementation="flash_attention_2"/attn_implementation="sdpa"/g' sft_12hz.py
 
-# 5. Start Trening (SFT) - Nå peker vi på LOKAL modellmappe
+# 5. Start Trening (SFT)
+# HER bruker vi den lokale mappen vi lastet ned i steg 2
 echo "[5/6] Starter trening..."
 accelerate launch sft_12hz.py \
     --init_model_path /workspace/base_model \
