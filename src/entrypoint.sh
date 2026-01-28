@@ -2,7 +2,7 @@
 set -e
 
 echo "=================================================="
-echo "   NORWEGIAN QWEN3-TTS FINETUNER (FIXED)          "
+echo "   NORWEGIAN QWEN3-TTS FINETUNER (FIXED V2)       "
 echo "=================================================="
 
 # 1. Klon Qwen3-TTS repoet
@@ -28,14 +28,18 @@ python prepare_data.py \
     --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
     --device cuda:0
 
-# --- FIX: Patch scriptet for å øke gradient accumulation ---
-# Scriptet har hardkodet 'gradient_accumulation_steps=4'. Vi endrer det til 8 for bedre stabilitet.
-echo "[INFO] Patcher sft_12hz.py for å bruke accumulation=8..."
+# --- FIXES FOR QWEN TRAINING SCRIPT ---
+echo "[INFO] Patcher sft_12hz.py..."
+
+# Fix 1: Øk gradient accumulation for stabilitet (4 -> 8)
 sed -i 's/gradient_accumulation_steps=4/gradient_accumulation_steps=8/g' sft_12hz.py
 
+# Fix 2: Legg til manglende 'project_dir' for Tensorboard-logging
+# Vi endrer: log_with="tensorboard"
+# Til:       log_with="tensorboard", project_dir=args.output_model_path
+sed -i 's/log_with="tensorboard"/log_with="tensorboard", project_dir=args.output_model_path/g' sft_12hz.py
+
 # 4. Start Trening (SFT)
-# Fjernet --gradient_accumulation_steps og --save_steps da scriptet ikke støtter dem som argumenter.
-# Scriptet lagrer automatisk en checkpoint etter hver epoch.
 echo "[4/5] Starter trening..."
 accelerate launch sft_12hz.py \
     --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
