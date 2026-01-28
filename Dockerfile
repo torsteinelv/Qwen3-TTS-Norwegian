@@ -1,10 +1,10 @@
-# Vi bruker samme base som sist, men sikrer at vi har nødvendige system-avhengigheter
+# Vi bruker samme base som sist
 FROM nvcr.io/nvidia/pytorch:24.01-py3
 
 # Unngå spørsmål under installasjon
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Installer system-biblioteker for lyd (viktig for soundfile/librosa)
+# Installer system-biblioteker for lyd
 RUN apt-get update && apt-get install -y \
     libsndfile1 \
     ffmpeg \
@@ -17,9 +17,6 @@ WORKDIR /workspace
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
-
-# --- FIX: Installer flash-attn manuelt med riktig flagg ---
-RUN pip install flash-attn --no-build-isolation
 
 # Kopier kildekoden din
 COPY src/ /workspace/src/
