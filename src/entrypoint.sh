@@ -2,27 +2,26 @@
 set -e
 
 echo "=================================================="
-echo "   NORWEGIAN QWEN3-TTS FINETUNER (20GB VRAM)      "
+echo "   NORWEGIAN QWEN3-TTS FINETUNER (AUTO-UPLOAD)    "
 echo "=================================================="
 
-# 1. Klon Qwen3-TTS repoet (vi trenger trenings-scriptene derfra)
+# 1. Klon Qwen3-TTS repoet
 if [ ! -d "Qwen3-TTS" ]; then
-    echo "[1/4] Cloner Qwen3-TTS repo..."
+    echo "[1/5] Cloner Qwen3-TTS repo..."
     git clone https://github.com/QwenLM/Qwen3-TTS.git
 else
-    echo "[1/4] Qwen3-TTS repo finnes allerede."
+    echo "[1/5] Qwen3-TTS repo finnes allerede."
 fi
 
-# Gå til finetuning mappen for å ha tilgang til scripts
+# Gå til finetuning mappen
 cd Qwen3-TTS/finetuning
 
 # 2. Generer datasett (WAV + JSONL)
-echo "[2/4] Bygger datasett fra NPSC..."
+echo "[2/5] Bygger datasett fra NPSC..."
 python /workspace/src/data_npsc.py
 
 # 3. Preprosesser data (Audio -> Codes)
-# Dette bruker prepare_data.py fra Qwen3 repoet
-echo "[3/4] Ekstraherer audio codes (Tokenizing)..."
+echo "[3/5] Ekstraherer audio codes (Tokenizing)..."
 python prepare_data.py \
     --input_jsonl /workspace/data/train.jsonl \
     --output_jsonl /workspace/data/train_with_codes.jsonl \
@@ -30,11 +29,7 @@ python prepare_data.py \
     --device cuda:0
 
 # 4. Start Trening (SFT)
-# Innstillinger optimalisert for 20GB VRAM:
-# - Batch size 2 (øker stabilitet over 1)
-# - Gradient accumulation 8 (effektiv batch size = 16)
-# - Epochs 5 (Nok til å høre forskjell)
-echo "[4/4] Starter trening..."
+echo "[4/5] Starter trening..."
 accelerate launch sft_12hz.py \
     --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --train_jsonl /workspace/data/train_with_codes.jsonl \
@@ -46,4 +41,26 @@ accelerate launch sft_12hz.py \
     --save_steps 100 \
     --speaker_name "norsk_taler"
 
-echo "✅ TRENING FERDIG! Sjekk /workspace/output for resultater."
+# 5. Last opp til Hugging Face
+echo "[5/5] Ser etter resultater for opplasting..."
+
+if [ -n "$HF_REPO_ID" ] && [ -n "$HF_TOKEN" ]; then
+    # Finn mappen med det siste sjekkpunktet (sorterer på tid, tar nyeste)
+    LAST_CHECKPOINT=$(ls -dt /workspace/output/checkpoint-epoch-* | head -1)
+    
+    if [ -z "$LAST_CHECKPOINT" ]; then
+        echo "❌ Fant ingen checkpoints i /workspace/output! Treningen kan ha feilet."
+    else
+        echo "📤 Fant ferdig modell: $LAST_CHECKPOINT"
+        echo "🚀 Laster opp til Hugging Face: $HF_REPO_ID"
+        
+        python /workspace/src/upload_to_hf.py \
+            --local_dir "$LAST_CHECKPOINT" \
+            --repo_id "$HF_REPO_ID"
+    fi
+else
+    echo "⚠️  HF_REPO_ID eller HF_TOKEN mangler. Hopper over opplasting."
+    echo "   (Modellen ligger lokalt i output-mappen)"
+fi
+
+echo "✅ JOBB FERDIG!"
