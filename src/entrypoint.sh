@@ -2,7 +2,7 @@
 set -e
 
 echo "=================================================="
-echo "   NORWEGIAN QWEN3-TTS FINETUNER (AUTO-UPLOAD)    "
+echo "   NORWEGIAN QWEN3-TTS FINETUNER (FIXED)          "
 echo "=================================================="
 
 # 1. Klon Qwen3-TTS repoet
@@ -22,24 +22,28 @@ python /workspace/src/data_npsc.py
 
 # 3. Preprosesser data (Audio -> Codes)
 echo "[3/5] Ekstraherer audio codes (Tokenizing)..."
-# --- FIX: Endret fra --model_path til --tokenizer_model_path ---
 python prepare_data.py \
     --input_jsonl /workspace/data/train.jsonl \
     --output_jsonl /workspace/data/train_with_codes.jsonl \
     --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
     --device cuda:0
 
+# --- FIX: Patch scriptet for å øke gradient accumulation ---
+# Scriptet har hardkodet 'gradient_accumulation_steps=4'. Vi endrer det til 8 for bedre stabilitet.
+echo "[INFO] Patcher sft_12hz.py for å bruke accumulation=8..."
+sed -i 's/gradient_accumulation_steps=4/gradient_accumulation_steps=8/g' sft_12hz.py
+
 # 4. Start Trening (SFT)
+# Fjernet --gradient_accumulation_steps og --save_steps da scriptet ikke støtter dem som argumenter.
+# Scriptet lagrer automatisk en checkpoint etter hver epoch.
 echo "[4/5] Starter trening..."
 accelerate launch sft_12hz.py \
     --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --train_jsonl /workspace/data/train_with_codes.jsonl \
     --output_model_path /workspace/output \
     --batch_size 2 \
-    --gradient_accumulation_steps 8 \
     --lr 1e-5 \
     --num_epochs 5 \
-    --save_steps 100 \
     --speaker_name "norsk_taler"
 
 # 5. Last opp til Hugging Face
