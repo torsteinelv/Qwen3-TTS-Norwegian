@@ -2,7 +2,7 @@
 set -e
 
 echo "=================================================="
-echo "   NORWEGIAN QWEN3-TTS FINETUNER (FIXED V2)       "
+echo "   NORWEGIAN QWEN3-TTS FINETUNER (SDPA EDITION)   "
 echo "=================================================="
 
 # 1. Klon Qwen3-TTS repoet
@@ -35,9 +35,10 @@ echo "[INFO] Patcher sft_12hz.py..."
 sed -i 's/gradient_accumulation_steps=4/gradient_accumulation_steps=8/g' sft_12hz.py
 
 # Fix 2: Legg til manglende 'project_dir' for Tensorboard-logging
-# Vi endrer: log_with="tensorboard"
-# Til:       log_with="tensorboard", project_dir=args.output_model_path
 sed -i 's/log_with="tensorboard"/log_with="tensorboard", project_dir=args.output_model_path/g' sft_12hz.py
+
+# Fix 3: Bytt fra 'flash_attention_2' til 'sdpa' (PyTorch native) for å unngå versjonsfeil
+sed -i 's/attn_implementation="flash_attention_2"/attn_implementation="sdpa"/g' sft_12hz.py
 
 # 4. Start Trening (SFT)
 echo "[4/5] Starter trening..."
