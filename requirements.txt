@@ -11,5 +11,4 @@ scipy
 tensorboard
 huggingface_hub
 modelscope
-flash-attn --no-build-isolation
-qwen-tts  # Det offisielle biblioteket
+qwen-tts
