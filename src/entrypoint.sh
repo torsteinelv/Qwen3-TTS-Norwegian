@@ -22,10 +22,11 @@ python /workspace/src/data_npsc.py
 
 # 3. Preprosesser data (Audio -> Codes)
 echo "[3/5] Ekstraherer audio codes (Tokenizing)..."
+# --- FIX: Endret fra --model_path til --tokenizer_model_path ---
 python prepare_data.py \
     --input_jsonl /workspace/data/train.jsonl \
     --output_jsonl /workspace/data/train_with_codes.jsonl \
-    --model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
+    --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
     --device cuda:0
 
 # 4. Start Trening (SFT)
@@ -45,7 +46,7 @@ accelerate launch sft_12hz.py \
 echo "[5/5] Ser etter resultater for opplasting..."
 
 if [ -n "$HF_REPO_ID" ] && [ -n "$HF_TOKEN" ]; then
-    # Finn mappen med det siste sjekkpunktet (sorterer på tid, tar nyeste)
+    # Finn mappen med det siste sjekkpunktet
     LAST_CHECKPOINT=$(ls -dt /workspace/output/checkpoint-epoch-* | head -1)
     
     if [ -z "$LAST_CHECKPOINT" ]; then
