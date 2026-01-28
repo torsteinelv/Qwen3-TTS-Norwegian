@@ -2,7 +2,7 @@
 set -e
 
 echo "=================================================="
-echo "   NORWEGIAN QWEN3-TTS FINETUNER (FINAL V4)       "
+echo "   NORWEGIAN QWEN3-TTS FINETUNER (PROD V5)        "
 echo "=================================================="
 
 # 1. Klon Qwen3-TTS repoet
@@ -13,7 +13,7 @@ else
     echo "[1/6] Qwen3-TTS repo finnes allerede."
 fi
 
-# 2. Last ned BASIS-modellen lokalt (for å unngå krasj etter trening)
+# 2. Last ned BASIS-modellen lokalt
 echo "[2/6] Laster ned basismodell til disk..."
 if [ ! -d "/workspace/base_model" ]; then
     huggingface-cli download \
@@ -27,33 +27,25 @@ fi
 # Gå til finetuning mappen
 cd Qwen3-TTS/finetuning
 
-# 3. Generer datasett (WAV + JSONL)
+# 3. Generer datasett
 echo "[3/6] Bygger datasett fra NPSC..."
 python /workspace/src/data_npsc.py
 
-# 4. Preprosesser data (Audio -> Codes)
-# VIKTIG ENDRING HER: Vi peker tilbake til Tokenizer-repoet på HF!
-echo "[4/6] Ekstraherer audio codes (Tokenizing)..."
+# 4. Tokenizing (Henter tokenizer fra HF)
+echo "[4/6] Ekstraherer audio codes..."
 python prepare_data.py \
     --input_jsonl /workspace/data/train.jsonl \
     --output_jsonl /workspace/data/train_with_codes.jsonl \
     --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
     --device cuda:0
 
-# --- FIXES FOR QWEN TRAINING SCRIPT ---
+# --- PATCHING ---
 echo "[INFO] Patcher sft_12hz.py..."
-
-# Fix 1: Øk gradient accumulation (4 -> 8)
 sed -i 's/gradient_accumulation_steps=4/gradient_accumulation_steps=8/g' sft_12hz.py
-
-# Fix 2: Legg til project_dir for logging
 sed -i 's/log_with="tensorboard"/log_with="tensorboard", project_dir=args.output_model_path/g' sft_12hz.py
-
-# Fix 3: Bruk SDPA istedenfor Flash Attention 2
 sed -i 's/attn_implementation="flash_attention_2"/attn_implementation="sdpa"/g' sft_12hz.py
 
-# 5. Start Trening (SFT)
-# HER bruker vi den lokale mappen vi lastet ned i steg 2
+# 5. Start Trening
 echo "[5/6] Starter trening..."
 accelerate launch sft_12hz.py \
     --init_model_path /workspace/base_model \
@@ -64,10 +56,23 @@ accelerate launch sft_12hz.py \
     --num_epochs 5 \
     --speaker_name "norsk_taler"
 
-# 6. Last opp til Hugging Face
-echo "[6/6] Ser etter resultater for opplasting..."
+# 6. Last opp til Hugging Face (FIX: Finn siste sjekkpunkt!)
+echo "[6/6] Ser etter resultater..."
+
+# Finn mappen som ble sist endret (nyeste checkpoint)
+LAST_CHECKPOINT=$(ls -td /workspace/output/checkpoint-* | head -1)
+
+if [ -z "$LAST_CHECKPOINT" ]; then
+    echo "❌ Fant ingen checkpoints! Laster opp hele output-mappen for debug..."
+    TARGET_DIR="/workspace/output"
+else
+    echo "📤 Fant ferdig modell: $LAST_CHECKPOINT"
+    # Vi laster opp innholdet i denne mappen direkte til roten av repoet
+    TARGET_DIR="$LAST_CHECKPOINT"
+fi
+
 python /workspace/src/upload_to_hf.py \
-    --local_dir "/workspace/output" \
+    --local_dir "$TARGET_DIR" \
     --repo_id "$HF_REPO_ID"
 
 echo "✅ JOBB FERDIG!"
