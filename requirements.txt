@@ -4,7 +4,7 @@ torchvision
 accelerate
 transformers>=4.48.0
 peft
-datasets
+datasets==2.21.0
 librosa
 soundfile
 scipy
