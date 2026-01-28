@@ -18,6 +18,9 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
+# --- FIX: Installer flash-attn manuelt med riktig flagg ---
+RUN pip install flash-attn --no-build-isolation
+
 # Kopier kildekoden din
 COPY src/ /workspace/src/
 
