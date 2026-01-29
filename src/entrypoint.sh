@@ -6,7 +6,9 @@ LOG_FILE="/workspace/output/console_log.txt"
 mkdir -p /workspace/output
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-echo "🚀 Starting Entrypoint Script (Hybrid Fix Edition)"
+echo "=================================================="
+echo "   NORWEGIAN QWEN3-TTS LIBRIVOX FINETUNER vFinal  "
+echo "=================================================="
 
 upload_logs() {
     echo "🏁 Script finished. Uploading logs..."
@@ -33,6 +35,7 @@ WORKDIR="/workspace"
 REPO_DIR="$WORKDIR/Qwen3-TTS"
 FINETUNE_DIR="$REPO_DIR/finetuning"
 
+# Dagens parametere (Batch size 1 for sikkerhet)
 export NUM_EPOCHS=${NUM_EPOCHS:-4} 
 export LEARNING_RATE=${LEARNING_RATE:-"2e-6"}
 export BATCH_SIZE=${BATCH_SIZE:-1}
@@ -40,7 +43,7 @@ export PREPARE_BATCH_SIZE=${PREPARE_BATCH_SIZE:-16}
 
 # --- 3. PREPARE ---
 if [ ! -d "$REPO_DIR" ]; then
-    echo "📦 Cloning Qwen3-TTS repository..."
+    echo "[1/6] Cloning Qwen3-TTS repository..."
     git clone https://github.com/QwenLM/Qwen3-TTS.git "$REPO_DIR"
 fi
 cd "$FINETUNE_DIR"
@@ -48,37 +51,44 @@ cd "$FINETUNE_DIR"
 echo "🔑 Logging into Hugging Face..."
 huggingface-cli login --token "$HF_TOKEN"
 
-# Steg A: Last ned BASE-modellen lokalt (For trening/lagring)
-echo "📥 Downloading Base Model locally (for SFT)..."
+# Steg A: Last ned BASIS-modellen lokalt (Kopi fra i går!)
+echo "[2/6] Laster ned basismodell til disk..."
 MODEL_LOCAL_DIR="/workspace/base_model"
-python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id='Qwen/Qwen3-TTS-12Hz-1.7B-Base', local_dir='$MODEL_LOCAL_DIR')
-"
-echo "✅ Base model downloaded to $MODEL_LOCAL_DIR"
+if [ ! -d "$MODEL_LOCAL_DIR" ]; then
+    huggingface-cli download \
+        --token "$HF_TOKEN" \
+        --resume-download "Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
+        --local-dir "$MODEL_LOCAL_DIR"
+else
+    echo "Basismodell ligger allerede lokalt."
+fi
 
-echo "📚 Building Dataset..."
+echo "[3/6] Bygger LibriVox datasett..."
 python3 /workspace/src/data_nb_librivox.py
 
 # --- PATCHING ---
-echo "🔧 Patching prepare_data.py..."
+echo "[INFO] Patcher scripts..."
+
+# Fiks 1: Minne-fiks for prepare_data (Viktig i dag!)
 sed -i "s/BATCH_INFER_NUM = 32/BATCH_INFER_NUM = $PREPARE_BATCH_SIZE/g" prepare_data.py
 
-echo "🔧 Patching sft_12hz.py..."
+# Fiks 2: Tensorboard-sti (Viktig for at sft ikke skal krasje)
 sed -i 's/log_with="tensorboard")/log_with="tensorboard", project_dir="\/workspace\/output")/g' sft_12hz.py
 
 # --- KJØRING ---
 
-# Steg B: prepare_data bruker ONLINE tokenizer (Fikser Unknown Architecture feilen)
-echo "⚙️ Running prepare_data.py..."
+# Steg B: prepare_data bruker REMOTE tokenizer (Slik dere gjorde i går!)
+# Dette unngår "Unknown Architecture" feilen
+echo "[4/6] Ekstraherer audio codes..."
 python3 prepare_data.py \
   --device cuda:0 \
   --tokenizer_model_path "Qwen/Qwen3-TTS-Tokenizer-12Hz" \
   --input_jsonl train_raw.jsonl \
   --output_jsonl train_with_codes.jsonl
 
-# Steg C: sft_12hz bruker LOKAL base-modell (Fikser shutil lagringsfeilen)
-echo "🔥 Starting SFT Training..."
+# Steg C: sft_12hz bruker LOKAL modell (Slik dere gjorde i går!)
+# Dette unngår "FileNotFound" ved lagring
+echo "[5/6] Starter trening..."
 python3 sft_12hz.py \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output \
@@ -93,12 +103,14 @@ LAST_EPOCH_IDX=$((NUM_EPOCHS - 1))
 CHECKPOINT_DIR="/workspace/output/checkpoint-epoch-$LAST_EPOCH_IDX"
 export CHECKPOINT_DIR="$CHECKPOINT_DIR"
 
+echo "[6/6] Ser etter resultater..."
 if [ -d "$CHECKPOINT_DIR" ]; then
-    echo "✅ Training done! Uploading..."
+    echo "✅ Fant ferdig modell: $CHECKPOINT_DIR. Laster opp..."
     
     if [ -f "/workspace/src/upload_to_hf.py" ]; then
         python3 /workspace/src/upload_to_hf.py --local_dir "$CHECKPOINT_DIR" --repo_id "$HF_REPO_ID"
     else
+        # Fallback hvis upload script mangler
         cat << EOF > upload_simple.py
 import os
 from huggingface_hub import HfApi
@@ -116,4 +128,4 @@ else
     exit 1
 fi
 
-echo "🎉 JOB DONE!"
+echo "✅ JOBB FERDIG!"
