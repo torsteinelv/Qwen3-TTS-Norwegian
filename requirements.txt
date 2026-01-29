@@ -1,14 +1,3 @@
-torch
-torchaudio
-torchvision
-accelerate
-transformers>=4.48.0
-peft
 datasets==2.21.0
-librosa
-soundfile
-scipy
-tensorboard
 huggingface_hub
-modelscope
 qwen-tts
