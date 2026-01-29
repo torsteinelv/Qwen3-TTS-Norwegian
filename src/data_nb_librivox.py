@@ -2,7 +2,7 @@ import os
 import json
 import csv
 import soundfile as sf
-import librosa # <-- VIKTIG: Vi bruker denne til resampling
+import librosa
 import numpy as np
 from huggingface_hub import hf_hub_download, login
 
@@ -10,10 +10,10 @@ from huggingface_hub import hf_hub_download, login
 OUTPUT_DIR = "/workspace/data" 
 JSONL_PATH = "train_raw.jsonl"
 TARGET_SPEAKER = "Kathrine Engan"
-MAX_SAMPLES = 2000
+# MAX_SAMPLES = 2000  <-- KOMMENTERT UT (Vi vil ha alt!)
 REF_FILENAME = "reference_master.wav"
 REPO_ID = "NbAiLab/nb-librivox"
-TARGET_SR = 24000 # <-- Qwen3 KREVER 24kHz
+TARGET_SR = 24000
 
 def build_librivox_dataset():
     token = os.getenv("HF_TOKEN")
@@ -43,14 +43,17 @@ def build_librivox_dataset():
     ref_saved = False
     
     print(f"🔍 Starter filtrering av CSV for: '{TARGET_SPEAKER}' (Mål: {TARGET_SR}Hz)")
+    print("🚀 KJØRER I FULL-MODUS (Ingen begrensning på antall filer)")
 
     with open(meta_local_path, mode='r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         
         for row in reader:
-            if count >= MAX_SAMPLES:
-                print(f"🛑 Nådde {MAX_SAMPLES} samples.")
-                break
+            # --- FJERNET SPERREN HER ---
+            # if count >= MAX_SAMPLES:
+            #     print(f"🛑 Nådde {MAX_SAMPLES} samples.")
+            #     break
+            # ---------------------------
 
             speaker_name = row.get('speaker_name', '')
             if TARGET_SPEAKER.lower() not in str(speaker_name).lower():
@@ -60,7 +63,6 @@ def build_librivox_dataset():
             text = row['text']
 
             try:
-                # Last ned filen
                 local_audio_path = hf_hub_download(
                     repo_id=REPO_ID,
                     filename=repo_filename,
@@ -68,20 +70,16 @@ def build_librivox_dataset():
                     token=token
                 )
                 
-                # --- RESAMPLING MAGI HER --- 🎵
-                # Vi bruker librosa til å laste inn OG resample i én operasjon
+                # Resampling til 24kHz
                 audio_array, sr = librosa.load(local_audio_path, sr=TARGET_SR)
                 
-                # Sjekk lengde (mellom 1 og 20 sekunder)
                 duration = len(audio_array) / sr
                 if duration < 1.0 or duration > 20.0:
                     continue
 
-                # Lagre filen (Nå er den garantert 24kHz)
                 filename = f"{OUTPUT_DIR}/ke_{count:05d}.wav"
                 sf.write(filename, audio_array, sr)
 
-                # --- REFERANSE-LOGIKK ---
                 ref_path = f"{OUTPUT_DIR}/{REF_FILENAME}"
                 if not ref_saved:
                     if 4.0 < duration < 10.0:
@@ -89,7 +87,7 @@ def build_librivox_dataset():
                         ref_saved = True
                         print(f"✅ MASTER REFERANSE LAGRET (24kHz): {ref_path}")
                     else:
-                        continue # Vent på en god referanse først
+                        continue 
                 
                 entry = {
                     "audio": filename,
@@ -111,7 +109,7 @@ def build_librivox_dataset():
         for line in jsonl_data:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
 
-    print("🎉 Dataset ferdig bygget (24kHz)! Klar for prepare_data.py")
+    print(f"🎉 Dataset ferdig bygget! Totalt {count} filer klar for trening.")
 
 if __name__ == "__main__":
     build_librivox_dataset()
