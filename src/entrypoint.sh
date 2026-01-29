@@ -6,7 +6,7 @@ LOG_FILE="/workspace/output/console_log.txt"
 mkdir -p /workspace/output
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-echo "🚀 Starting Entrypoint Script (Save Fix Edition)"
+echo "🚀 Starting Entrypoint Script (Hybrid Fix Edition)"
 
 upload_logs() {
     echo "🏁 Script finished. Uploading logs..."
@@ -35,7 +35,7 @@ FINETUNE_DIR="$REPO_DIR/finetuning"
 
 export NUM_EPOCHS=${NUM_EPOCHS:-4} 
 export LEARNING_RATE=${LEARNING_RATE:-"2e-6"}
-export BATCH_SIZE=${BATCH_SIZE:-1} # Sikkerhetsnett
+export BATCH_SIZE=${BATCH_SIZE:-1}
 export PREPARE_BATCH_SIZE=${PREPARE_BATCH_SIZE:-16}
 
 # --- 3. PREPARE ---
@@ -48,8 +48,8 @@ cd "$FINETUNE_DIR"
 echo "🔑 Logging into Hugging Face..."
 huggingface-cli login --token "$HF_TOKEN"
 
-# 👇 NYTT: Vi laster ned modellen til en lokal mappe først!
-echo "📥 Downloading Base Model locally..."
+# Steg A: Last ned BASE-modellen lokalt (For trening/lagring)
+echo "📥 Downloading Base Model locally (for SFT)..."
 MODEL_LOCAL_DIR="/workspace/base_model"
 python3 -c "
 from huggingface_hub import snapshot_download
@@ -68,15 +68,17 @@ echo "🔧 Patching sft_12hz.py..."
 sed -i 's/log_with="tensorboard")/log_with="tensorboard", project_dir="\/workspace\/output")/g' sft_12hz.py
 
 # --- KJØRING ---
+
+# Steg B: prepare_data bruker ONLINE tokenizer (Fikser Unknown Architecture feilen)
 echo "⚙️ Running prepare_data.py..."
 python3 prepare_data.py \
   --device cuda:0 \
-  --tokenizer_model_path "$MODEL_LOCAL_DIR" \
+  --tokenizer_model_path "Qwen/Qwen3-TTS-Tokenizer-12Hz" \
   --input_jsonl train_raw.jsonl \
   --output_jsonl train_with_codes.jsonl
 
+# Steg C: sft_12hz bruker LOKAL base-modell (Fikser shutil lagringsfeilen)
 echo "🔥 Starting SFT Training..."
-# Merk: Vi peker nå init_model_path til den lokale mappen!
 python3 sft_12hz.py \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output \
