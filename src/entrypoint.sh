@@ -1,78 +1,39 @@
 #!/bin/bash
 set -e
 
-echo "=================================================="
-echo "   NORWEGIAN QWEN3-TTS FINETUNER (PROD V5)        "
-echo "=================================================="
-
-# 1. Klon Qwen3-TTS repoet
-if [ ! -d "Qwen3-TTS" ]; then
-    echo "[1/6] Cloner Qwen3-TTS repo..."
-    git clone https://github.com/QwenLM/Qwen3-TTS.git
-else
-    echo "[1/6] Qwen3-TTS repo finnes allerede."
-fi
-
-# 2. Last ned BASIS-modellen lokalt
-echo "[2/6] Laster ned basismodell til disk..."
-if [ ! -d "/workspace/base_model" ]; then
-    huggingface-cli download \
-        --token "$HF_TOKEN" \
-        --resume-download "Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
-        --local-dir /workspace/base_model
-else
-    echo "Basismodell ligger allerede lokalt."
-fi
-
-# Gå til finetuning mappen
+# 1. Hent selve trenings-scriptene (de følger ikke med pip-pakken)
+echo "📦 Cloner Qwen3-TTS repo for å få tak i trenings-koden..."
+git clone https://github.com/QwenLM/Qwen3-TTS.git
 cd Qwen3-TTS/finetuning
 
-# 3. Generer datasett
-echo "[3/6] Bygger datasett fra NPSC..."
-python /workspace/src/data_npsc.py
+# 2. Logg inn på HF (Tokenet hentes fra env variabler i k8s)
+huggingface-cli login --token $HF_TOKEN
 
-# 4. Tokenizing (Henter tokenizer fra HF)
-echo "[4/6] Ekstraherer audio codes..."
-python prepare_data.py \
-    --input_jsonl /workspace/data/train.jsonl \
-    --output_jsonl /workspace/data/train_with_codes.jsonl \
-    --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
-    --device cuda:0
+# 3. Kjør ditt Python-script som bygger dataset (LibriVox)
+# (Antar at du legger build_dataset.py i /workspace/src/ og flytter den hit,
+# eller kjører den direkte)
+echo "📚 Bygger dataset..."
+python3 /workspace/src/build_dataset.py
 
-# --- PATCHING ---
-echo "[INFO] Patcher sft_12hz.py..."
-sed -i 's/gradient_accumulation_steps=4/gradient_accumulation_steps=8/g' sft_12hz.py
-sed -i 's/log_with="tensorboard"/log_with="tensorboard", project_dir=args.output_model_path/g' sft_12hz.py
-sed -i 's/attn_implementation="flash_attention_2"/attn_implementation="sdpa"/g' sft_12hz.py
+# 4. Prepare data (Lager 12Hz codes)
+echo "⚙️ Prosesserer data..."
+python3 prepare_data.py \
+  --device cuda:0 \
+  --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
+  --input_jsonl train_raw.jsonl \
+  --output_jsonl train_with_codes.jsonl
 
-# 5. Start Trening
-echo "[5/6] Starter trening..."
-accelerate launch sft_12hz.py \
-    --init_model_path /workspace/base_model \
-    --train_jsonl /workspace/data/train_with_codes.jsonl \
-    --output_model_path /workspace/output \
-    --batch_size 2 \
-    --lr 1e-5 \
-    --num_epochs 5 \
-    --speaker_name "norsk_taler"
+# 5. Start trening
+echo "🚀 Starter trening..."
+python3 sft_12hz.py \
+  --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --output_model_path /workspace/output \
+  --train_jsonl train_with_codes.jsonl \
+  --batch_size 2 \
+  --lr 2e-5 \
+  --num_epochs 2 \
+  --speaker_name norsk_taler
 
-# 6. Last opp til Hugging Face (FIX: Finn siste sjekkpunkt!)
-echo "[6/6] Ser etter resultater..."
-
-# Finn mappen som ble sist endret (nyeste checkpoint)
-LAST_CHECKPOINT=$(ls -td /workspace/output/checkpoint-* | head -1)
-
-if [ -z "$LAST_CHECKPOINT" ]; then
-    echo "❌ Fant ingen checkpoints! Laster opp hele output-mappen for debug..."
-    TARGET_DIR="/workspace/output"
-else
-    echo "📤 Fant ferdig modell: $LAST_CHECKPOINT"
-    # Vi laster opp innholdet i denne mappen direkte til roten av repoet
-    TARGET_DIR="$LAST_CHECKPOINT"
-fi
-
-python /workspace/src/upload_to_hf.py \
-    --local_dir "$TARGET_DIR" \
-    --repo_id "$HF_REPO_ID"
-
-echo "✅ JOBB FERDIG!"
+# 6. Last opp
+echo "📤 Laster opp..."
+# (Legg inn opplastingskoden din her eller kjør et python-script)
