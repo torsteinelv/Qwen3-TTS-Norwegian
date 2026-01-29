@@ -6,7 +6,7 @@ LOG_FILE="/workspace/output/console_log.txt"
 mkdir -p /workspace/output
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-echo "🚀 Starting Entrypoint Script (Dynamic Config Edition)"
+echo "🚀 Starting Entrypoint Script (Final-Final Fix)"
 
 upload_logs() {
     echo "🏁 Script finished. Uploading logs..."
@@ -33,19 +33,10 @@ WORKDIR="/workspace"
 REPO_DIR="$WORKDIR/Qwen3-TTS"
 FINETUNE_DIR="$REPO_DIR/finetuning"
 
-# Trenings-parametre
 export NUM_EPOCHS=${NUM_EPOCHS:-4} 
 export LEARNING_RATE=${LEARNING_RATE:-"2e-6"}
 export BATCH_SIZE=${BATCH_SIZE:-2}
-
-# 👇 NY VARIABEL: Denne styrer prepare_data.py (Default 16)
 export PREPARE_BATCH_SIZE=${PREPARE_BATCH_SIZE:-16}
-
-echo "⚙️ Config loaded:"
-echo "   - Train Batch Size: $BATCH_SIZE"
-echo "   - Prepare Batch Size: $PREPARE_BATCH_SIZE"
-echo "   - Epochs: $NUM_EPOCHS"
-echo "   - LR: $LEARNING_RATE"
 
 # --- 3. PREPARE ---
 if [ ! -d "$REPO_DIR" ]; then
@@ -60,9 +51,18 @@ huggingface-cli login --token "$HF_TOKEN"
 echo "📚 Building Dataset..."
 python3 /workspace/src/data_nb_librivox.py
 
-# 👇 HER ER MAGIEN: Vi bruker miljøvariabelen til å bestemme tallet i sed-kommandoen
+# --- PATCHING (Reparasjoner) ---
+
+# 1. Fiks prepare_data.py (Minne-problemet)
 echo "🔧 Patching prepare_data.py to use BATCH_INFER_NUM = $PREPARE_BATCH_SIZE..."
 sed -i "s/BATCH_INFER_NUM = 32/BATCH_INFER_NUM = $PREPARE_BATCH_SIZE/g" prepare_data.py
+
+# 2. Fiks sft_12hz.py (Tensorboard-problemet) - NY! 👇
+echo "🔧 Patching sft_12hz.py to fix logging path..."
+# Vi legger til 'project_dir' i Accelerator-kallet slik at Tensorboard vet hvor det skal lagre ting
+sed -i 's/log_with="tensorboard")/log_with="tensorboard", project_dir="\/workspace\/output")/g' sft_12hz.py
+
+# --- KJØRING ---
 
 echo "⚙️ Running prepare_data.py..."
 python3 prepare_data.py \
@@ -71,7 +71,6 @@ python3 prepare_data.py \
   --input_jsonl train_raw.jsonl \
   --output_jsonl train_with_codes.jsonl
 
-# --- 4. TRAIN ---
 echo "🔥 Starting SFT Training..."
 python3 sft_12hz.py \
   --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
@@ -82,7 +81,7 @@ python3 sft_12hz.py \
   --num_epochs $NUM_EPOCHS \
   --speaker_name norsk_taler
 
-# --- 5. UPLOAD & VALIDATE ---
+# --- 5. UPLOAD ---
 LAST_EPOCH_IDX=$((NUM_EPOCHS - 1))
 CHECKPOINT_DIR="/workspace/output/checkpoint-epoch-$LAST_EPOCH_IDX"
 export CHECKPOINT_DIR="$CHECKPOINT_DIR"
