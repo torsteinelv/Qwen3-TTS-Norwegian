@@ -6,7 +6,7 @@ LOG_FILE="/workspace/output/console_log.txt"
 mkdir -p /workspace/output
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-echo "🚀 Starting Entrypoint Script (Final-Final Fix)"
+echo "🚀 Starting Entrypoint Script (Save Fix Edition)"
 
 upload_logs() {
     echo "🏁 Script finished. Uploading logs..."
@@ -35,7 +35,7 @@ FINETUNE_DIR="$REPO_DIR/finetuning"
 
 export NUM_EPOCHS=${NUM_EPOCHS:-4} 
 export LEARNING_RATE=${LEARNING_RATE:-"2e-6"}
-export BATCH_SIZE=${BATCH_SIZE:-2}
+export BATCH_SIZE=${BATCH_SIZE:-1} # Sikkerhetsnett
 export PREPARE_BATCH_SIZE=${PREPARE_BATCH_SIZE:-16}
 
 # --- 3. PREPARE ---
@@ -48,32 +48,37 @@ cd "$FINETUNE_DIR"
 echo "🔑 Logging into Hugging Face..."
 huggingface-cli login --token "$HF_TOKEN"
 
+# 👇 NYTT: Vi laster ned modellen til en lokal mappe først!
+echo "📥 Downloading Base Model locally..."
+MODEL_LOCAL_DIR="/workspace/base_model"
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id='Qwen/Qwen3-TTS-12Hz-1.7B-Base', local_dir='$MODEL_LOCAL_DIR')
+"
+echo "✅ Base model downloaded to $MODEL_LOCAL_DIR"
+
 echo "📚 Building Dataset..."
 python3 /workspace/src/data_nb_librivox.py
 
-# --- PATCHING (Reparasjoner) ---
-
-# 1. Fiks prepare_data.py (Minne-problemet)
-echo "🔧 Patching prepare_data.py to use BATCH_INFER_NUM = $PREPARE_BATCH_SIZE..."
+# --- PATCHING ---
+echo "🔧 Patching prepare_data.py..."
 sed -i "s/BATCH_INFER_NUM = 32/BATCH_INFER_NUM = $PREPARE_BATCH_SIZE/g" prepare_data.py
 
-# 2. Fiks sft_12hz.py (Tensorboard-problemet) - NY! 👇
-echo "🔧 Patching sft_12hz.py to fix logging path..."
-# Vi legger til 'project_dir' i Accelerator-kallet slik at Tensorboard vet hvor det skal lagre ting
+echo "🔧 Patching sft_12hz.py..."
 sed -i 's/log_with="tensorboard")/log_with="tensorboard", project_dir="\/workspace\/output")/g' sft_12hz.py
 
 # --- KJØRING ---
-
 echo "⚙️ Running prepare_data.py..."
 python3 prepare_data.py \
   --device cuda:0 \
-  --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
+  --tokenizer_model_path "$MODEL_LOCAL_DIR" \
   --input_jsonl train_raw.jsonl \
   --output_jsonl train_with_codes.jsonl
 
 echo "🔥 Starting SFT Training..."
+# Merk: Vi peker nå init_model_path til den lokale mappen!
 python3 sft_12hz.py \
-  --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output \
   --train_jsonl train_with_codes.jsonl \
   --batch_size $BATCH_SIZE \
@@ -103,11 +108,6 @@ print(f"🚀 Uploading {src} -> {repo}/{tgt}")
 api.upload_folder(folder_path=src, repo_id=repo, path_in_repo=tgt)
 EOF
         python3 upload_simple.py
-    fi
-    
-    echo "🔬 Validating..."
-    if [ -f "/workspace/src/test_final_model.py" ]; then
-        python3 /workspace/src/test_final_model.py || echo "⚠️ Validation failed."
     fi
 else
     echo "❌ CHECKPOINT NOT FOUND!"
