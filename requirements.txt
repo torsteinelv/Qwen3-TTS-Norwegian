@@ -3,3 +3,4 @@ datasets==2.21.0
 huggingface_hub
 qwen-tts
 torchvision
+accelerate
