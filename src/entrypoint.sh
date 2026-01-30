@@ -37,7 +37,7 @@ trap upload_logs EXIT
 WORKDIR="/workspace"
 REPO_DIR="$WORKDIR/Qwen3-TTS"
 FINETUNE_DIR="$REPO_DIR/finetuning"
-DATA_DIR="/workspace/data"  # <--- NY: Vi bruker denne konsekvent!
+DATA_DIR="/workspace/data"  # <--- VIKTIG: Alt lagres på den persistente disken!
 
 # Dagens parametere
 export NUM_EPOCHS=${NUM_EPOCHS:-10} 
@@ -57,17 +57,22 @@ huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
 
 # --- 4. PREPARE MODEL & DATA ---
 
-# Steg A: Last ned BASIS-modellen (Til PVC)
+# Steg A: Last ned BASIS-modellen (Til PVC) - MED SJEKK FOR KORRUPT FIL
 echo "[2/6] Sjekker basismodell..."
 MODEL_LOCAL_DIR="/workspace/base_model"
-if [ ! -d "$MODEL_LOCAL_DIR" ] || [ -z "$(ls -A $MODEL_LOCAL_DIR)" ]; then
-    echo "📥 Laster ned basismodell til disk..."
+CONFIG_FILE="$MODEL_LOCAL_DIR/config.json"
+
+# Sjekk: Finnes config.json og er den større enn 0 bytes?
+if [ ! -s "$CONFIG_FILE" ]; then
+    echo "⚠️  Fant ingen gyldig modell (eller korrupt fil). Renser opp og laster ned..."
+    rm -rf "$MODEL_LOCAL_DIR"/* # Slett gammelt rask
+    
     huggingface-cli download \
         --token "$HF_TOKEN" \
         --resume-download "Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
         --local-dir "$MODEL_LOCAL_DIR"
 else
-    echo "✅ Basismodell funnet på disk. Skipper nedlasting."
+    echo "✅ Gyldig basismodell funnet på disk. Skipper nedlasting."
 fi
 
 # Steg B: Bygg jsonl-filen (Sjekker nå på PVC!)
@@ -77,7 +82,7 @@ if [ ! -f "$RAW_JSONL" ]; then
     echo "[3/6] Bygger LibriVox datasett..."
     python3 /workspace/src/data_nb_librivox.py
     
-    # Siden python-scriptet lagrer i CWD, flytter vi den til safe-zone
+    # Siden python-scriptet lagrer i CWD, flytter vi den til safe-zone (PVC)
     if [ -f "train_raw.jsonl" ]; then
         mv train_raw.jsonl "$RAW_JSONL"
         echo "✅ Flyttet train_raw.jsonl til $DATA_DIR"
@@ -115,6 +120,7 @@ if [ -n "$RESUME_REPO_ID" ]; then
 fi
 
 echo "🚀 Kjører trening..."
+# Bruker accelerate launch for bedre minnestyring + små bokstaver på navn
 accelerate launch --num_processes 1 train_norwegian.py \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output \
@@ -122,7 +128,7 @@ accelerate launch --num_processes 1 train_norwegian.py \
   --batch_size $BATCH_SIZE \
   --lr $LEARNING_RATE \
   --num_epochs $NUM_EPOCHS \
-  --speaker_name "Kathrine" \
+  --speaker_name "kathrine" \
   $EXTRA_ARGS
 
 echo "✅ JOBB FERDIG!"
