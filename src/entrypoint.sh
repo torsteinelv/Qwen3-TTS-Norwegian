@@ -10,7 +10,7 @@ echo "=================================================="
 echo "   NORWEGIAN QWEN3-TTS LIBRIVOX FINETUNER vTurbo  "
 echo "=================================================="
 
-# Funksjon for å laste opp loggen hvis scriptet dør
+# Funksjon for å laste opp loggen
 upload_logs() {
     echo "🏁 Script finished/exited. Uploading logs..."
     python3 -c "
@@ -37,6 +37,7 @@ trap upload_logs EXIT
 WORKDIR="/workspace"
 REPO_DIR="$WORKDIR/Qwen3-TTS"
 FINETUNE_DIR="$REPO_DIR/finetuning"
+DATA_DIR="/workspace/data"  # <--- NY: Vi bruker denne konsekvent!
 
 # Dagens parametere
 export NUM_EPOCHS=${NUM_EPOCHS:-10} 
@@ -56,48 +57,57 @@ huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
 
 # --- 4. PREPARE MODEL & DATA ---
 
-# Steg A: Last ned BASIS-modellen lokalt
-echo "[2/6] Laster ned basismodell til disk..."
+# Steg A: Last ned BASIS-modellen (Til PVC)
+echo "[2/6] Sjekker basismodell..."
 MODEL_LOCAL_DIR="/workspace/base_model"
-if [ ! -d "$MODEL_LOCAL_DIR" ]; then
+if [ ! -d "$MODEL_LOCAL_DIR" ] || [ -z "$(ls -A $MODEL_LOCAL_DIR)" ]; then
+    echo "📥 Laster ned basismodell til disk..."
     huggingface-cli download \
         --token "$HF_TOKEN" \
         --resume-download "Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
         --local-dir "$MODEL_LOCAL_DIR"
 else
-    echo "✅ Basismodell ligger allerede lokalt."
+    echo "✅ Basismodell funnet på disk. Skipper nedlasting."
 fi
 
-# Steg B: Bygg jsonl-filen (hvis den mangler)
-if [ ! -f "train_raw.jsonl" ]; then
+# Steg B: Bygg jsonl-filen (Sjekker nå på PVC!)
+RAW_JSONL="$DATA_DIR/train_raw.jsonl"
+
+if [ ! -f "$RAW_JSONL" ]; then
     echo "[3/6] Bygger LibriVox datasett..."
-    # Vi bruker full path til scriptet ditt
     python3 /workspace/src/data_nb_librivox.py
+    
+    # Siden python-scriptet lagrer i CWD, flytter vi den til safe-zone
+    if [ -f "train_raw.jsonl" ]; then
+        mv train_raw.jsonl "$RAW_JSONL"
+        echo "✅ Flyttet train_raw.jsonl til $DATA_DIR"
+    fi
+else
+    echo "✅ Fant eksisterende datasett ($RAW_JSONL). Skipper bygging."
 fi
 
-# Steg C: Patching av scripts (fremdeles nødvendig for prepare_data)
+# Steg C: Patching
 echo "[INFO] Patcher scripts..."
 sed -i "s/BATCH_INFER_NUM = 32/BATCH_INFER_NUM = $PREPARE_BATCH_SIZE/g" prepare_data.py
 
-# Steg D: Ekstraher audio codes (Tung prosess, kjøres kun hvis train_with_codes mangler)
-if [ ! -f "train_with_codes.jsonl" ]; then
+# Steg D: Ekstraher audio codes (Sjekker på PVC!)
+CODES_JSONL="$DATA_DIR/train_with_codes.jsonl"
+
+if [ ! -f "$CODES_JSONL" ]; then
     echo "[4/6] Ekstraherer audio codes..."
     python3 prepare_data.py \
       --device cuda:0 \
       --tokenizer_model_path "Qwen/Qwen3-TTS-Tokenizer-12Hz" \
-      --input_jsonl train_raw.jsonl \
-      --output_jsonl train_with_codes.jsonl
+      --input_jsonl "$RAW_JSONL" \
+      --output_jsonl "$CODES_JSONL"
 else
-    echo "✅ Audio codes allerede generert. Hopper over."
+    echo "✅ Audio codes allerede generert ($CODES_JSONL). Hopper over."
 fi
 
 # --- 5. TRAINING ---
-echo "[5/6] Starter trening med custom norsk-optimalisert script..."
-
-# Kopierer vårt nye script inn i arbeidsmappen
+echo "[5/6] Starter trening..."
 cp /workspace/src/train_norwegian.py . 
 
-# Sjekk om vi skal RESUME (Fortsette) fra en tidligere jobb
 EXTRA_ARGS=""
 if [ -n "$RESUME_REPO_ID" ]; then
     echo "🔄 RESUME DETECTED: Vil fortsette fra $RESUME_REPO_ID"
@@ -105,18 +115,14 @@ if [ -n "$RESUME_REPO_ID" ]; then
 fi
 
 echo "🚀 Kjører trening..."
-echo "   Batch Size: $BATCH_SIZE"
-echo "   Epochs:     $NUM_EPOCHS"
-
-# Vi bruker 'accelerate launch' for bedre GPU-styring
 accelerate launch --num_processes 1 train_norwegian.py \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output \
-  --train_jsonl train_with_codes.jsonl \
+  --train_jsonl "$CODES_JSONL" \
   --batch_size $BATCH_SIZE \
   --lr $LEARNING_RATE \
   --num_epochs $NUM_EPOCHS \
   --speaker_name "Kathrine" \
   $EXTRA_ARGS
 
-echo "✅ JOBB FERDIG! (Alle epoker er lastet opp underveis)"
+echo "✅ JOBB FERDIG!"
