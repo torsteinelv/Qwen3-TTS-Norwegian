@@ -111,7 +111,7 @@ def train():
         accelerator.print("⚠️ ADVARSEL: Fant ikke text_projection direkte.")
 
     # --- 3. ÅPNE FLERE LAG (4 lag) ---
-    LAYERS_TO_UNFREEZE = 4
+    LAYERS_TO_UNFREEZE = 0
     accelerator.print(f"🔓 Unfreezing first {LAYERS_TO_UNFREEZE} talker layers...")
     if hasattr(model.talker.model, "layers"):
         for i in range(LAYERS_TO_UNFREEZE):
