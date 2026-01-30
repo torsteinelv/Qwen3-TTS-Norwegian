@@ -88,8 +88,23 @@ python3 prepare_data.py \
 
 # Steg C: sft_12hz bruker LOKAL modell (Slik dere gjorde i går!)
 # Dette unngår "FileNotFound" ved lagring
-echo "[5/6] Starter trening..."
-python3 sft_12hz.py \
+#echo "[5/6] Starter trening..."
+#python3 sft_12hz.py \
+#  --init_model_path "$MODEL_LOCAL_DIR" \
+#  --output_model_path /workspace/output \
+#  --train_jsonl train_with_codes.jsonl \
+#  --batch_size $BATCH_SIZE \
+#  --lr $LEARNING_RATE \
+#  --num_epochs $NUM_EPOCHS \
+#  --speaker_name norsk_taler
+
+# Nytt
+echo "[5/6] Starter trening med custom norsk-optimalisert script..."
+
+# Kopierer vårt script inn i mappen der Qwen-bibliotekene er tilgjengelige
+cp /workspace/src/train_norwegian.py . 
+
+python3 train_norwegian.py \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output \
   --train_jsonl train_with_codes.jsonl \
