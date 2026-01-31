@@ -7,6 +7,7 @@ import types
 from torch.utils.data import Dataset
 from peft import LoraConfig, get_peft_model
 from transformers import TrainingArguments, Trainer, AutoProcessor
+from huggingface_hub import HfApi
 
 # Importerer wrapperen
 try:
@@ -30,28 +31,20 @@ class TTSDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        # ChatML format
+        # ChatML format er kritisk for Qwen3
         full_text = f"<|im_start|>assistant\n{item['text']}<|im_end|>\n<|im_start|>assistant\n"
         inputs = self.processor(text=full_text, return_tensors="pt")
         
-        # Audio codes må være [seq_len, 16]
-        audio_codes = torch.tensor(item["audio_codes"], dtype=torch.long)
-        if audio_codes.dim() == 1:
-            # Hvis lagret som [seq_len], må vi anta det er første codebook og fylle resten med pad (0)
-            # Men prepare_data.py lagrer vanligvis [seq_len, 16]
-            pass
-            
         return {
             "input_ids": inputs["input_ids"].squeeze(0),
-            "audio_codes": audio_codes
+            "audio_codes": torch.tensor(item["audio_codes"], dtype=torch.long)
         }
 
     def collate_fn(self, features):
         input_ids = torch.nn.utils.rnn.pad_sequence(
-            [f["input_ids"] for f in features], batch_first=True, padding_value=151671
+            [f["input_ids"] for f in features], batch_first=True, padding_value=151671 # tts_pad_token_id
         )
         
-        # FIKS: Padding for 3D tensors [batch, seq, 16]
         audio_codes = [f["audio_codes"] for f in features]
         max_len = max(c.size(0) for c in audio_codes)
         num_codebooks = audio_codes[0].size(1) if audio_codes[0].dim() > 1 else 16
@@ -59,7 +52,7 @@ class TTSDataset(Dataset):
         padded_audio_codes = torch.zeros((len(audio_codes), max_len, num_codebooks), dtype=torch.long)
         for i, c in enumerate(audio_codes):
             l = c.size(0)
-            if c.dim() == 1: # Fallback hvis koden er flat
+            if c.dim() == 1:
                 padded_audio_codes[i, :l, 0] = c
             else:
                 padded_audio_codes[i, :l, :c.size(1)] = c
@@ -75,6 +68,7 @@ def train():
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--hf_repo_id", type=str, default=os.getenv("HF_REPO_ID"))
     
     args, _ = parser.parse_known_args()
 
@@ -85,26 +79,16 @@ def train():
     wrapper = Qwen3TTSModel.from_pretrained(args.init_model_path, dtype=torch.bfloat16, trust_remote_code=True)
     model = wrapper.model.talker 
 
-    # --- MONKEY PATCH FOR Å LØSE AssertionError ---
+    # Monkey patch for å omgå NoneType-error under trening
     def custom_forward(self, input_ids=None, audio_codes=None, **kwargs):
-        # 1. Hent tekst-embeddings
         raw_text_embeds = self.model.text_embedding(input_ids)
-        
-        # 2. Projiser og hent siste hidden state for talker-input
-        # Qwen3 bruker siste token av tekst-prosedyren som start-trigger for tale
         talker_hidden_states = self.text_projection(raw_text_embeds)[:, -1, :]
         
-        # 3. Verifiser form på audio_codes før vi kaller finetune
-        # Den interne funksjonen 'forward_sub_talker_finetune' forventer [batch, seq, 16]
-        # Men internt i den funksjonen gjøres en sjekk på dimensjoner.
-        # Vi flater ut batchen hvis nødvendig for å passe med Qwen3 sin interne logikk
-        
-        # Målretter finetuning-funksjonen direkte
+        # Bruker den interne finetune-funksjonen for stabilitet
         _, loss = self.forward_sub_talker_finetune(
-            audio_codes.view(-1, audio_codes.size(-1)), # Flater batch og seq til én dim
-            talker_hidden_states.repeat_interleave(audio_codes.size(1), dim=0) # Matcher lengden
+            audio_codes.view(-1, audio_codes.size(-1)), 
+            talker_hidden_states.repeat_interleave(audio_codes.size(1), dim=0)
         )
-        
         return {"loss": loss}
 
     model.forward = types.MethodType(custom_forward, model)
@@ -117,7 +101,7 @@ def train():
         task_type="FEATURE_EXTRACTION"
     )
     
-    print("🚀 Aktiverer LoRA på talker-modulen...")
+    print("🚀 Aktiverer LoRA...")
     model = get_peft_model(model, peft_config)
 
     dataset = TTSDataset(args.train_jsonl, processor)
@@ -128,10 +112,11 @@ def train():
         gradient_accumulation_steps=4,
         learning_rate=args.lr,
         num_train_epochs=args.num_epochs,
-        logging_steps=1,
+        logging_steps=5,
         bf16=True,
         remove_unused_columns=False,
-        report_to="none"
+        report_to="none",
+        save_strategy="epoch"
     )
 
     trainer = Trainer(
@@ -144,9 +129,24 @@ def train():
     print("🔥 Starter trening!")
     trainer.train()
 
+    # --- LAGRING OG OPPLASTING ---
     print("💾 Lagrer LoRA-adapter...")
     model.save_pretrained(args.output_model_path)
-    print(f"✅ Fullført! Modell lagret til {args.output_model_path}")
+    
+    if args.hf_repo_id and os.getenv("HF_TOKEN"):
+        try:
+            print(f"🚀 Laster opp til Hugging Face: {args.hf_repo_id}...")
+            api = HfApi(token=os.getenv("HF_TOKEN"))
+            api.upload_folder(
+                folder_path=args.output_model_path,
+                repo_id=args.hf_repo_id,
+                repo_type="model"
+            )
+            print("✅ Opplasting fullført!")
+        except Exception as e:
+            print(f"⚠️ Opplasting feilet: {e}")
+    else:
+        print("ℹ️ Ingen HF_REPO_ID eller TOKEN funnet, hopper over opplasting.")
 
 if __name__ == "__main__":
     train()
