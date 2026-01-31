@@ -7,10 +7,10 @@ mkdir -p /workspace/output
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "=================================================="
-echo "   NORWEGIAN QWEN3-TTS LIBRIVOX FINETUNER vTurbo  "
+echo "   NORWEGIAN QWEN3-TTS LORA FINETUNER (vTurbo)    "
 echo "=================================================="
 
-# Funksjon for å laste opp loggen
+# Funksjon for å laste opp loggen ved krasj/slutt
 upload_logs() {
     echo "🏁 Script finished/exited. Uploading logs..."
     python3 -c "
@@ -37,13 +37,20 @@ trap upload_logs EXIT
 WORKDIR="/workspace"
 REPO_DIR="$WORKDIR/Qwen3-TTS"
 FINETUNE_DIR="$REPO_DIR/finetuning"
-DATA_DIR="/workspace/data"  # <--- VIKTIG: Alt lagres på den persistente disken!
+DATA_DIR="/workspace/data"
 
-# Dagens parametere
-export NUM_EPOCHS=${NUM_EPOCHS:-10} 
-export LEARNING_RATE=${LEARNING_RATE:-"2e-6"}
+# Standard parametere (Tilpasset LoRA)
+# Merk: LoRA tåler høyere learning rate (1e-4) enn full finetuning.
+export NUM_EPOCHS=${NUM_EPOCHS:-15} 
+export LEARNING_RATE=${LEARNING_RATE:-"1e-4"} 
 export BATCH_SIZE=${BATCH_SIZE:-4}
 export PREPARE_BATCH_SIZE=${PREPARE_BATCH_SIZE:-16}
+
+# Sikkerhetssjekk: Installer PEFT hvis det mangler i imaget
+if ! python3 -c "import peft" &> /dev/null; then
+    echo "📦 PEFT mangler, installerer..."
+    pip install peft
+fi
 
 # --- 3. PREPARE REPO ---
 if [ ! -d "$REPO_DIR" ]; then
@@ -57,45 +64,43 @@ huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
 
 # --- 4. PREPARE MODEL & DATA ---
 
-# Steg A: Last ned BASIS-modellen (Til PVC) - MED SJEKK FOR KORRUPT FIL
+# Steg A: Last ned BASIS-modellen
 echo "[2/6] Sjekker basismodell..."
 MODEL_LOCAL_DIR="/workspace/base_model"
 CONFIG_FILE="$MODEL_LOCAL_DIR/config.json"
 
-# Sjekk: Finnes config.json og er den større enn 0 bytes?
 if [ ! -s "$CONFIG_FILE" ]; then
-    echo "⚠️  Fant ingen gyldig modell (eller korrupt fil). Renser opp og laster ned..."
-    rm -rf "$MODEL_LOCAL_DIR"/* # Slett gammelt rask
-    
+    echo "⚠️  Fant ingen gyldig modell. Laster ned..."
+    rm -rf "$MODEL_LOCAL_DIR"/*
     huggingface-cli download \
         --token "$HF_TOKEN" \
         --resume-download "Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
         --local-dir "$MODEL_LOCAL_DIR"
 else
-    echo "✅ Gyldig basismodell funnet på disk. Skipper nedlasting."
+    echo "✅ Gyldig basismodell funnet på disk."
 fi
 
-# Steg B: Bygg jsonl-filen (Sjekker nå på PVC!)
+# Steg B: Bygg jsonl-filen
 RAW_JSONL="$DATA_DIR/train_raw.jsonl"
 
 if [ ! -f "$RAW_JSONL" ]; then
     echo "[3/6] Bygger LibriVox datasett..."
+    # Kjører scriptet fra src-mappen
     python3 /workspace/src/data_nb_librivox.py
     
-    # Siden python-scriptet lagrer i CWD, flytter vi den til safe-zone (PVC)
     if [ -f "train_raw.jsonl" ]; then
         mv train_raw.jsonl "$RAW_JSONL"
         echo "✅ Flyttet train_raw.jsonl til $DATA_DIR"
     fi
 else
-    echo "✅ Fant eksisterende datasett ($RAW_JSONL). Skipper bygging."
+    echo "✅ Fant eksisterende datasett ($RAW_JSONL)."
 fi
 
-# Steg C: Patching
+# Steg C: Patching for Audio Codes
 echo "[INFO] Patcher scripts..."
 sed -i "s/BATCH_INFER_NUM = 32/BATCH_INFER_NUM = $PREPARE_BATCH_SIZE/g" prepare_data.py
 
-# Steg D: Ekstraher audio codes (Sjekker på PVC!)
+# Steg D: Ekstraher audio codes
 CODES_JSONL="$DATA_DIR/train_with_codes.jsonl"
 
 if [ ! -f "$CODES_JSONL" ]; then
@@ -106,29 +111,45 @@ if [ ! -f "$CODES_JSONL" ]; then
       --input_jsonl "$RAW_JSONL" \
       --output_jsonl "$CODES_JSONL"
 else
-    echo "✅ Audio codes allerede generert ($CODES_JSONL). Hopper over."
+    echo "✅ Audio codes allerede generert. Hopper over."
 fi
 
-# --- 5. TRAINING ---
-echo "[5/6] Starter trening..."
-cp /workspace/src/train_norwegian.py . 
+# --- 5. TRAINING (LORA MODE) ---
+echo "[5/6] Klargjør LoRA-trening..."
+
+# Kopierer LoRA-scriptet vårt inn til kjøre-mappen
+# Dette er viktig for at den skal finne riktig fil uten 'sed'-hacking
+cp /workspace/src/train_lora_norwegian.py . 
 
 EXTRA_ARGS=""
-if [ -n "$RESUME_REPO_ID" ]; then
-    echo "🔄 RESUME DETECTED: Vil fortsette fra $RESUME_REPO_ID"
-    EXTRA_ARGS="$EXTRA_ARGS --resume_repo_id $RESUME_REPO_ID"
-fi
+# Hvis du vil resume fra et checkpoint senere, kan du legge til logikk her
 
-echo "🚀 Kjører trening..."
-# Bruker accelerate launch for bedre minnestyring + små bokstaver på navn
-accelerate launch --num_processes 1 train_norwegian.py \
+echo "🚀 Kjører LoRA-trening..."
+echo "   - Batch Size: $BATCH_SIZE"
+echo "   - LR: $LEARNING_RATE"
+
+# --- GAMMEL METODE (Kommentert ut) ---
+# accelerate launch --num_processes 1 train_norwegian.py \
+#   --init_model_path "$MODEL_LOCAL_DIR" \
+#   --output_model_path /workspace/output \
+#   --train_jsonl "$CODES_JSONL" \
+#   --batch_size $BATCH_SIZE \
+#   --lr "2e-6" \
+#   --num_epochs $NUM_EPOCHS \
+#   --speaker_name "kathrine"
+
+# --- NY METODE (LoRA) ---
+accelerate launch --num_processes 1 train_lora_norwegian.py \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output \
   --train_jsonl "$CODES_JSONL" \
   --batch_size $BATCH_SIZE \
+  --gradient_accumulation_steps 4 \
   --lr $LEARNING_RATE \
   --num_epochs $NUM_EPOCHS \
-  --speaker_name "kathrine" \
-  $EXTRA_ARGS
+  --use_peft \
+  --lora_rank 16 \
+  --lora_alpha 32 \
+  --lora_dropout 0.05
 
 echo "✅ JOBB FERDIG!"
