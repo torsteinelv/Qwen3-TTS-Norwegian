@@ -139,7 +139,7 @@ echo "   - LR: $LEARNING_RATE"
 #   --speaker_name "kathrine"
 
 # --- NY METODE (LoRA) ---
-accelerate launch --num_processes 1 train_lora_norwegian.py \
+accelerate launch --num_processes 1 train_lora_norwegian2.py \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output \
   --train_jsonl "$CODES_JSONL" \
