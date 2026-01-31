@@ -7,7 +7,7 @@ import types
 from torch.utils.data import Dataset
 from peft import LoraConfig, get_peft_model
 from transformers import TrainingArguments, Trainer, AutoProcessor
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, login
 
 # Importerer wrapperen
 try:
@@ -31,7 +31,7 @@ class TTSDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        # ChatML format er kritisk for Qwen3
+        # ChatML format er kritisk for Qwen3 sin forståelse av instruksjoner
         full_text = f"<|im_start|>assistant\n{item['text']}<|im_end|>\n<|im_start|>assistant\n"
         inputs = self.processor(text=full_text, return_tensors="pt")
         
@@ -41,10 +41,12 @@ class TTSDataset(Dataset):
         }
 
     def collate_fn(self, features):
+        # Padding for tekst (151671 = tts_pad_token_id)
         input_ids = torch.nn.utils.rnn.pad_sequence(
-            [f["input_ids"] for f in features], batch_first=True, padding_value=151671 # tts_pad_token_id
+            [f["input_ids"] for f in features], batch_first=True, padding_value=151671
         )
         
+        # Padding for 3D tensors [batch, seq, 16]
         audio_codes = [f["audio_codes"] for f in features]
         max_len = max(c.size(0) for c in audio_codes)
         num_codebooks = audio_codes[0].size(1) if audio_codes[0].dim() > 1 else 16
@@ -63,7 +65,7 @@ class TTSDataset(Dataset):
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--init_model_path", type=str, default="/workspace/base_model")
-    parser.add_argument("--output_model_path", type=str, default="/workspace/output")
+    parser.add_argument("--output_model_path", type=str, default="/workspace/output/test_run")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -79,12 +81,12 @@ def train():
     wrapper = Qwen3TTSModel.from_pretrained(args.init_model_path, dtype=torch.bfloat16, trust_remote_code=True)
     model = wrapper.model.talker 
 
-    # Monkey patch for å omgå NoneType-error under trening
+    # Monkey patch for å omgå NoneType-error i Qwen3 sin standard forward-metode
     def custom_forward(self, input_ids=None, audio_codes=None, **kwargs):
         raw_text_embeds = self.model.text_embedding(input_ids)
         talker_hidden_states = self.text_projection(raw_text_embeds)[:, -1, :]
         
-        # Bruker den interne finetune-funksjonen for stabilitet
+        # Bruker den interne finetuning-metoden i modellfilen
         _, loss = self.forward_sub_talker_finetune(
             audio_codes.view(-1, audio_codes.size(-1)), 
             talker_hidden_states.repeat_interleave(audio_codes.size(1), dim=0)
@@ -93,7 +95,7 @@ def train():
 
     model.forward = types.MethodType(custom_forward, model)
 
-    # LoRA konfigurasjon
+    # LoRA konfigurasjon målrettet mot transformator-lagene
     peft_config = LoraConfig(
         r=16, lora_alpha=32,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
@@ -129,24 +131,41 @@ def train():
     print("🔥 Starter trening!")
     trainer.train()
 
-    # --- LAGRING OG OPPLASTING ---
-    print("💾 Lagrer LoRA-adapter...")
-    model.save_pretrained(args.output_model_path)
-    
-    if args.hf_repo_id and os.getenv("HF_TOKEN"):
-        try:
-            print(f"🚀 Laster opp til Hugging Face: {args.hf_repo_id}...")
-            api = HfApi(token=os.getenv("HF_TOKEN"))
-            api.upload_folder(
-                folder_path=args.output_model_path,
-                repo_id=args.hf_repo_id,
-                repo_type="model"
-            )
-            print("✅ Opplasting fullført!")
-        except Exception as e:
-            print(f"⚠️ Opplasting feilet: {e}")
-    else:
-        print("ℹ️ Ingen HF_REPO_ID eller TOKEN funnet, hopper over opplasting.")
+    # --- 3. LAGRING OG OPPLASTING ---
+    if trainer.is_world_process_zero():
+        print("💾 Lagrer LoRA-adapter...")
+        model.save_pretrained(args.output_model_path)
+        
+        # FIKS: Genererer README med korrekt metadata for å unngå 'base_model' feil
+        base_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+        readme_path = os.path.join(args.output_model_path, "README.md")
+        readme_content = f"""---
+base_model: {base_model_id}
+library_name: peft
+tags:
+- text-to-speech
+- qwen3-tts
+- norwegian
+- lora
+---
+# Qwen3-TTS Norsk LoRA Adapter
+Dette er en norsk finetuning av Qwen3-TTS.
+"""
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(readme_content)
+
+        if args.hf_repo_id and os.getenv("HF_TOKEN"):
+            try:
+                print(f"🚀 Laster opp til Hugging Face: {args.hf_repo_id}...")
+                api = HfApi(token=os.getenv("HF_TOKEN"))
+                api.upload_folder(
+                    folder_path=args.output_model_path,
+                    repo_id=args.hf_repo_id,
+                    repo_type="model"
+                )
+                print("🎉 Opplasting fullført!")
+            except Exception as e:
+                print(f"⚠️ Opplasting feilet: {e}")
 
 if __name__ == "__main__":
     train()
