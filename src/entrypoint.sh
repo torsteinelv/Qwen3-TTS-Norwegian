@@ -128,28 +128,11 @@ echo "🚀 Kjører LoRA-trening..."
 echo "   - Batch Size: $BATCH_SIZE"
 echo "   - LR: $LEARNING_RATE"
 
-# --- GAMMEL METODE (Kommentert ut) ---
-# accelerate launch --num_processes 1 train_norwegian.py \
-#   --init_model_path "$MODEL_LOCAL_DIR" \
-#   --output_model_path /workspace/output \
-#   --train_jsonl "$CODES_JSONL" \
-#   --batch_size $BATCH_SIZE \
-#   --lr "2e-6" \
-#   --num_epochs $NUM_EPOCHS \
-#   --speaker_name "kathrine"
-
-# --- NY METODE (LoRA) ---
-accelerate launch --num_processes 1 train_lora_norwegian2.py \
-  --init_model_path "$MODEL_LOCAL_DIR" \
-  --output_model_path /workspace/output \
-  --train_jsonl "$CODES_JSONL" \
-  --batch_size $BATCH_SIZE \
-  --gradient_accumulation_steps 4 \
-  --lr $LEARNING_RATE \
-  --num_epochs $NUM_EPOCHS \
-  --use_peft \
-  --lora_rank 16 \
-  --lora_alpha 32 \
-  --lora_dropout 0.05
+python3 /workspace/src/train_lora_complete.py \
+  --train_jsonl /workspace/data/train_with_codes.jsonl \
+  --init_model_path /workspace/base_model \
+  --output_model_path /workspace/output/run_long \
+  --batch_size 4 \
+  --num_epochs 30
 
 echo "✅ JOBB FERDIG!"
