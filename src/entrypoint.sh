@@ -39,9 +39,8 @@ REPO_DIR="$WORKDIR/Qwen3-TTS"
 FINETUNE_DIR="$REPO_DIR/finetuning"
 DATA_DIR="/workspace/data"
 
-# Standard parametere (Tilpasset LoRA)
-# Merk: LoRA tåler høyere learning rate (1e-4) enn full finetuning.
-export NUM_EPOCHS=${NUM_EPOCHS:-15} 
+# Standard parametere (Kan overstyres av environment variables)
+export NUM_EPOCHS=${NUM_EPOCHS:-30} 
 export LEARNING_RATE=${LEARNING_RATE:-"1e-4"} 
 export BATCH_SIZE=${BATCH_SIZE:-4}
 export PREPARE_BATCH_SIZE=${PREPARE_BATCH_SIZE:-16}
@@ -52,7 +51,7 @@ if ! python3 -c "import peft" &> /dev/null; then
     pip install peft
 fi
 
-# --- 3. PREPARE REPO ---
+# --- 3. PREPARE REPO (Trengs for prepare_data.py) ---
 if [ ! -d "$REPO_DIR" ]; then
     echo "[1/6] Cloning Qwen3-TTS repository..."
     git clone https://github.com/QwenLM/Qwen3-TTS.git "$REPO_DIR"
@@ -85,7 +84,7 @@ RAW_JSONL="$DATA_DIR/train_raw.jsonl"
 
 if [ ! -f "$RAW_JSONL" ]; then
     echo "[3/6] Bygger LibriVox datasett..."
-    # Kjører scriptet fra src-mappen
+    # Kjører scriptet direkte fra src-mappen
     python3 /workspace/src/data_nb_librivox.py
     
     if [ -f "train_raw.jsonl" ]; then
@@ -96,7 +95,7 @@ else
     echo "✅ Fant eksisterende datasett ($RAW_JSONL)."
 fi
 
-# Steg C: Patching for Audio Codes
+# Steg C: Patching for Audio Codes (Optimalisering)
 echo "[INFO] Patcher scripts..."
 sed -i "s/BATCH_INFER_NUM = 32/BATCH_INFER_NUM = $PREPARE_BATCH_SIZE/g" prepare_data.py
 
@@ -115,24 +114,19 @@ else
 fi
 
 # --- 5. TRAINING (LORA MODE) ---
-echo "[5/6] Klargjør LoRA-trening..."
-
-# Kopierer LoRA-scriptet vårt inn til kjøre-mappen
-# Dette er viktig for at den skal finne riktig fil uten 'sed'-hacking
-cp /workspace/src/train_lora_norwegian.py . 
-
-EXTRA_ARGS=""
-# Hvis du vil resume fra et checkpoint senere, kan du legge til logikk her
-
-echo "🚀 Kjører LoRA-trening..."
+echo "[5/6] Starter LoRA-trening..."
+echo "   - Script: /workspace/src/train_lora_complete.py"
 echo "   - Batch Size: $BATCH_SIZE"
 echo "   - LR: $LEARNING_RATE"
+echo "   - Epochs: $NUM_EPOCHS"
 
-python3 /workspace/src/train_lora_complete.py \
-  --train_jsonl /workspace/data/train_with_codes.jsonl \
-  --init_model_path /workspace/base_model \
+# Vi kjører direkte mot filen som start.sh har hentet ned
+accelerate launch --num_processes 1 /workspace/src/train_lora_complete.py \
+  --train_jsonl "$CODES_JSONL" \
+  --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output/run_long \
-  --batch_size 4 \
-  --num_epochs 30
+  --batch_size $BATCH_SIZE \
+  --lr $LEARNING_RATE \
+  --num_epochs $NUM_EPOCHS
 
 echo "✅ JOBB FERDIG!"
