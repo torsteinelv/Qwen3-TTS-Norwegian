@@ -28,4 +28,4 @@ RUN chmod +x /workspace/src/entrypoint.sh
 RUN mkdir -p /workspace/data /workspace/output
 
 # Entrypoint styrer showet
-ENTRYPOINT ["/workspace/src/entrypoint.sh"]
+ENTRYPOINT ["/workspace/src/start.sh"]
