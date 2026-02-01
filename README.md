@@ -28,7 +28,7 @@ We are iterating through different finetuning strategies to solve the language a
 - [ ] **Experiment 4: LoRA "Safe Mode" (Low LR: 5e-5, Rank 16)**
   - **Method:** Restarting with lower Learning Rate and reduced Rank to stabilize convergence.
   - **Goal:** Convert the "mushy" sound into clear Norwegian words by allowing finer weight adjustments.
-  - **Status:** In progress (Target: 60 Epochs).
+  - **Status:** In progress (Target: 100 Epochs).
 
 ## Technical Configuration (LoRA)
 
