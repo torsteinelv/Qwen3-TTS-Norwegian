@@ -23,6 +23,7 @@ COPY src/ /workspace/src/
 
 # Gjør script kjørbare
 RUN chmod +x /workspace/src/entrypoint.sh
+RUN chmod +x /workspace/src/start.sh
 
 # Opprett mapper for data
 RUN mkdir -p /workspace/data /workspace/output
