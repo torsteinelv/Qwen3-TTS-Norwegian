@@ -185,7 +185,7 @@ def train():
     parser.add_argument("--output_model_path", type=str, default="output")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-4) # LoRA tåler høyere LR
+    parser.add_argument("--lr", type=float, default=5e-5) # LoRA tåler høyere LR
     parser.add_argument("--num_epochs", type=int, default=15)
     parser.add_argument("--hf_repo_id", type=str, default=os.getenv("HF_REPO_ID"))
     args = parser.parse_args()
@@ -214,8 +214,8 @@ def train():
     model.requires_grad_(False)
     
     peft_config = LoraConfig(
-        r=32, 
-        lora_alpha=64, 
+        r=16, 
+        lora_alpha=32, 
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], 
         lora_dropout=0.05, 
         bias="none", 
