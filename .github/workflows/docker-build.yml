@@ -1,8 +1,6 @@
 name: Build and Push Docker Image
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:  # Gjør at du kan kjøre den manuelt også
 
 env:
