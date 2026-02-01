@@ -126,6 +126,6 @@ accelerate launch --num_processes 1 /workspace/src/train_lora_complete.py \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output/run_long \
   --batch_size $BATCH_SIZE \
-  --num_epochs $NUM_EPOCHS
+  --num_epochs 100
 
 echo "✅ JOBB FERDIG!"
