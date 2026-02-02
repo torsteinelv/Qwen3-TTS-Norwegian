@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Qwen3-TTS Norwegian Fine-Tuning (FINAL FIX V2)
-==============================================
-1. Fixes static/noise by adding sub-talker loss.
+Qwen3-TTS Norwegian Fine-Tuning (FINAL FIX V3 - CRASH PROOF)
+============================================================
+1. Robust Sub-Talker Loss: Skips noise calculation if hidden_states are missing instead of crashing.
 2. Fixes language learning by unfreezing text_projection.
-3. Fixes 'NoneType' crash by forcing output_hidden_states in config.
-4. Forces 24kHz sampling rate.
+3. Forces 24kHz sampling rate.
 """
 
 import argparse
@@ -53,9 +52,8 @@ class NorwegianTTSDataset(Dataset):
 
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         try:
-            # Tving 24000 Hz her.
+            # Tving 24000 Hz.
             audio, sr = librosa.load(x, sr=24000, mono=True)
-            
             if len(audio) > 24000 * 15: 
                 audio = audio[:24000 * 15]
             return audio.astype(np.float32), int(sr)
@@ -93,8 +91,6 @@ class NorwegianTTSDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.items[idx]
-        
-        # Robust path finding
         ref_path = item.get("ref_audio") or item.get("ref_audio_path") or item.get("audio_path")
         if not ref_path:
             return self.__getitem__((idx + 1) % len(self.items))
@@ -206,7 +202,7 @@ def train():
     
     if accelerator.is_main_process:
         os.makedirs(args.output_model_path, exist_ok=True)
-        print("🚀 Starter norsk TTS-trening (Med Sub-Talker Loss & Real Unfreeze)")
+        print("🚀 Starter norsk TTS-trening (Crash-Proof V3)")
         print(f"   LR: {args.lr}, Upload hver {args.save_every}. epoch")
     
     # HF Setup
@@ -235,15 +231,12 @@ def train():
     )
     model.talker.model = get_peft_model(model.talker.model, peft_config)
     
-    # --- CRITICAL FIX START: FORCE CONFIG TO RETURN HIDDEN STATES ---
-    # Dette fikser "NoneType is not subscriptable" krasjen.
-    # Vi tvinger konfigurasjonen til å alltid beregne hidden states.
+    # Prøv å tvinge config (Best effort)
     model.talker.config.output_hidden_states = True
     if hasattr(model.talker.model, "config"):
         model.talker.model.config.output_hidden_states = True
-    # --- CRITICAL FIX END ---
 
-    # Unfreeze text_projection (for å lære norsk)
+    # Unfreeze text_projection
     if hasattr(model.talker, "text_projection"):
         print("🔓 Unfreezing text_projection parameters...")
         for p in model.talker.text_projection.parameters():
@@ -305,29 +298,32 @@ def train():
                 )
 
                 loss_main = outputs.loss
+                loss = loss_main # Startverdi
 
-                # Sjekk at vi faktisk fikk hidden states (Double safety check)
-                if outputs.hidden_states is None:
-                    # Hvis config-fixen feiler, bruk bare main loss for å unngå krasj
-                    if step == 0 and accelerator.is_main_process:
-                         print("⚠️ ADVARSEL: Fikk fortsatt ikke hidden states. Skipper sub-talker loss dette steget.")
-                    loss = loss_main
-                else:
-                    # Sub-Talker Loss (Fjerner støy)
+                # --- SIKKERHETSSJEKK FOR SUB-TALKER LOSS ---
+                # Vi prøver å hente hidden states. Hvis de mangler, SKIPPER vi denne delen
+                # i stedet for å krasje. Da trener vi i det minste norsken.
+                can_do_subtalker = False
+                
+                if outputs.hidden_states is not None and len(outputs.hidden_states) > 0:
                     last_hidden = outputs.hidden_states[-1]
-                    active_mask = codec_mask[:, :-1]
-                    
-                    if active_mask.sum() > 0:
-                        hs = last_hidden[:, :-1][active_mask]
-                        codes = codec_ids[:, :-1, :][active_mask]
+                    if last_hidden is not None:
+                        can_do_subtalker = True
                         
-                        sub_logits, sub_loss = model.talker.forward_sub_talker_finetune(
-                            codec_ids=codes,
-                            talker_hidden_states=hs,
-                        )
-                        loss = loss_main + sub_loss
-                    else:
-                        loss = loss_main
+                        active_mask = codec_mask[:, :-1]
+                        if active_mask.sum() > 0:
+                            hs = last_hidden[:, :-1][active_mask]
+                            codes = codec_ids[:, :-1, :][active_mask]
+                            
+                            sub_logits, sub_loss = model.talker.forward_sub_talker_finetune(
+                                codec_ids=codes,
+                                talker_hidden_states=hs,
+                            )
+                            loss = loss_main + sub_loss
+                
+                # Hvis vi ikke kunne kjøre sub-talker, logg det KUN første gang
+                if not can_do_subtalker and step == 0 and epoch == 0 and accelerator.is_main_process:
+                     print("⚠️ ADVARSEL: Hidden states mangler. Hopper over støyfjerning (Sub-Talker). Fortsetter med kun hovedtrening.")
 
                 accelerator.backward(loss)
                 optimizer.step()
@@ -359,8 +355,8 @@ def train():
                     "library_name: peft",
                     f"tags: [text-to-speech, norwegian, lora, pure-lora, epoch-{epoch+1}]",
                     "---",
-                    f"# Qwen3-TTS Norwegian (Final Fix) - Epoch {epoch+1}",
-                    "Includes Sub-Talker Loss training."
+                    f"# Qwen3-TTS Norwegian (V3 Crash-Proof) - Epoch {epoch+1}",
+                    "Includes Sub-Talker Loss (Best Effort) and Text Projection training."
                 ]
                 with open(os.path.join(save_path, "README.md"), "w", encoding="utf-8") as f:
                     f.write("\n".join(readme_lines))
