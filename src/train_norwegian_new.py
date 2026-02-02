@@ -29,8 +29,9 @@ from torch.optim import AdamW
 from accelerate import Accelerator
 from peft import LoraConfig, get_peft_model
 
-# Installer først: git clone https://github.com/QwenLM/Qwen3-TTS && cd Qwen3-TTS && pip install -e "."
-from qwen3_tts import Qwen3TTSModel
+import sys
+sys.path.append("/workspace/Qwen3-TTS") # Eller der repoet ligger
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
 
 # ==========================================
