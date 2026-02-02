@@ -113,15 +113,10 @@ else
     echo "✅ Audio codes allerede generert. Hopper over."
 fi
 
-# --- 5. TRAINING (LORA MODE) ---
-echo "[5/6] Starter LoRA-trening..."
-echo "   - Script: /workspace/src/train_lora_complete_new.py"
-echo "   - Batch Size: $BATCH_SIZE"
-echo "   - LR: $LEARNING_RATE"
-echo "   - Epochs: $NUM_EPOCHS"
+
 
 # Vi kjører direkte mot filen som start.sh har hentet ned
-accelerate launch --num_processes 1 /workspace/src/train_lora_complete.py \
+accelerate launch --num_processes 1 /workspace/src/train_norwegian_new.py \
   --train_jsonl "$CODES_JSONL" \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output/run_long \
