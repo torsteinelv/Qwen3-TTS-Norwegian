@@ -29,9 +29,8 @@ from torch.optim import AdamW
 from accelerate import Accelerator
 from peft import LoraConfig, get_peft_model
 
-import sys
-sys.path.append("/workspace/Qwen3-TTS") # Eller der repoet ligger
-from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+# Installer først: git clone https://github.com/QwenLM/Qwen3-TTS && cd Qwen3-TTS && pip install -e "."
+from qwen3_tts import Qwen3TTSModel
 
 
 # ==========================================
@@ -83,8 +82,9 @@ def extend_language_embedding(model):
 # 2. DATASET (bruker allerede genererte audio_codes fra prepare_data.py)
 # ==========================================
 class NorwegianTTSDataset(Dataset):
-    def __init__(self, jsonl_path, processor):
+    def __init__(self, jsonl_path, processor, language_embedding_size):
         self.processor = processor
+        self.language_embedding_size = language_embedding_size
         
         # Last data
         with open(jsonl_path, 'r', encoding='utf-8') as f:
@@ -178,11 +178,12 @@ class NorwegianTTSDataset(Dataset):
         ref_mels = torch.cat(ref_mels, dim=0)
         
         # Språk-ID (bruk utvidet lista!)
-        lang_idx = batch[0]["language"]  # "Norwegian"
-        language_ids = torch.tensor([
-            model.model.config.talker_config.languages.index(lang_idx)
-            for _ in batch
-        ], dtype=torch.long)
+        lang_idx = self.processor.tokenizer.languages.index("Norwegian") if hasattr(self.processor.tokenizer, 'languages') else -1
+        if lang_idx == -1:
+            # Fallback: bruk siste indeks (der "Norwegian" ble lagt til)
+            lang_idx = self.language_embedding_size - 1
+        
+        language_ids = torch.full((len(batch),), lang_idx, dtype=torch.long)
         
         return {
             "input_ids": padded_input_ids,
@@ -260,9 +261,11 @@ def train():
         print(f"   - Total trenbare: {total_trainable:,} / {total_params:,} ({total_trainable/total_params*100:.2f}%)")
     
     # Datasett (bruker allerede genererte audio_codes)
+    original_lang_size = len(model.model.config.talker_config.languages) - 1  # Før utvidelse
     dataset = NorwegianTTSDataset(
         jsonl_path=args.train_jsonl,
-        processor=model.processor
+        processor=model.processor,
+        language_embedding_size=len(model.model.config.talker_config.languages)
     )
     dataloader = DataLoader(
         dataset,
@@ -370,9 +373,8 @@ def train():
                 # Lagre config
                 accelerator.unwrap_model(model).model.config.save_pretrained(save_path)
                 
-                # ✅ FIX: Bruk ENKLE anførselstegn (''') for å unngå syntax error med """
-                with open(os.path.join(save_path, "README.md"), "w", encoding="utf-8") as f:
-                    f.write(f'''---
+                # ✅ FIX: Bruk vanlig streng + .format() for å unngå ALLE syntax errors
+                readme_content = """---
 base_model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
 library_name: peft
 tags:
@@ -381,7 +383,7 @@ tags:
 - norwegian
 - lora
 ---
-# Qwen3-TTS Norwegian LoRA (Epoch {epoch+1})
+# Qwen3-TTS Norwegian LoRA (Epoch {epoch})
 
 Trained with extended language embedding for Norwegian.
 
