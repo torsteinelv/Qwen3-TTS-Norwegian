@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """
-Qwen3-TTS Norwegian Fine-Tuning (Hardcoded Version)
-===================================================
-Ingen parametere. Ingen tull.
-- Pure LoRA (Ingen German hacks)
-- Robust Data Collator (Ingen krasj)
-- Auto-upload til HF hvert epoch
+Qwen3-TTS Norwegian Fine-Tuning (FIXED SAVE BUG)
+================================================
+Fixes KeyError 'dtype' by removing redundant config saving.
+Includes Auto-Upload to HF every epoch.
+
+Usage:
+  accelerate launch src/train_norwegian_new.py \
+    --train_jsonl ./data/train_with_codes.jsonl \
+    --init_model_path ./base_model \
+    --output_model_path ./output/run_pure_norwegian \
+    --batch_size 4 \
+    --num_epochs 100 \
+    --save_every 1 \
+    --hf_repo_id telvenes/qwen3-tts-norsk-finetune
 """
 
+import argparse
 import json
 import os
 import sys
@@ -21,16 +30,6 @@ from accelerate import Accelerator
 from peft import LoraConfig, get_peft_model
 from transformers import AutoConfig
 from huggingface_hub import HfApi
-
-# --- HARDKODEDE INNSTILLINGER ---
-TRAIN_JSONL = "/workspace/data/train_with_codes.jsonl"
-BASE_MODEL_PATH = "/workspace/base_model"
-OUTPUT_DIR = "/workspace/output/run_pure_norwegian"
-HF_REPO_ID = "telvenes/qwen3-tts-norsk-finetune"  # Endre hvis feil repo
-BATCH_SIZE = 4
-LEARNING_RATE = 1e-5  # Lav LR for norsk finpuss
-NUM_EPOCHS = 100
-SAVE_EVERY = 1        # Lagre og last opp HVER epoch
 
 # ==========================================
 # 0. IMPORT FIX
@@ -63,7 +62,7 @@ class NorwegianTTSDataset(Dataset):
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         try:
             audio, sr = librosa.load(x, sr=None, mono=True)
-            if len(audio) > 24000 * 15: # Cut max 15s
+            if len(audio) > 24000 * 15: 
                 audio = audio[:24000 * 15]
             return audio.astype(np.float32), int(sr)
         except Exception as e:
@@ -193,40 +192,48 @@ class NorwegianTTSDataset(Dataset):
 # 2. TRENING (MAIN)
 # ==========================================
 def train():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_jsonl", type=str, required=True)
+    parser.add_argument("--init_model_path", type=str, required=True)
+    parser.add_argument("--output_model_path", type=str, default="./qwen3-tts-norwegian-lora")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-5) # Lav LR!
+    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--save_every", type=int, default=1) # Lagre HVER epoch
+    parser.add_argument("--hf_repo_id", type=str, default=os.getenv("HF_REPO_ID"))
+    args = parser.parse_args()
+    
     accelerator = Accelerator(
         gradient_accumulation_steps=4,
         mixed_precision="bf16",
         log_with="tensorboard",
-        project_dir=OUTPUT_DIR
+        project_dir=args.output_model_path
     )
     
     if accelerator.is_main_process:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        print("🚀 Starter norsk TTS-trening (Hardcoded Pure LoRA)")
-        print(f"   LR: {LEARNING_RATE}, Upload hver {SAVE_EVERY}. epoch")
+        os.makedirs(args.output_model_path, exist_ok=True)
+        print("🚀 Starter norsk TTS-trening (Pure LoRA - Fixed Save)")
+        print(f"   LR: {args.lr}, Upload hver {args.save_every}. epoch")
     
     # HF Setup
     hf_api = None
-    if HF_REPO_ID and accelerator.is_main_process:
+    if args.hf_repo_id and accelerator.is_main_process:
         try:
             hf_api = HfApi()
-            print(f"☁️  HF Upload aktivert: {HF_REPO_ID}")
+            print(f"☁️  HF Upload aktivert: {args.hf_repo_id}")
         except Exception as e:
             print(f"⚠️  HF Error: {e}")
 
-    # Last modell
     qwen_wrapper = Qwen3TTSModel.from_pretrained(
-        BASE_MODEL_PATH,
+        args.init_model_path,
         dtype=torch.bfloat16, 
         device_map={"": accelerator.device},
         attn_implementation="flash_attention_2" if torch.cuda.is_available() else None
     )
     model = qwen_wrapper.model 
 
-    # Frys modell
     model.requires_grad_(False)
     
-    # Aktiver LoRA
     peft_config = LoraConfig(
         r=8, lora_alpha=16,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
@@ -234,31 +241,29 @@ def train():
     )
     model.talker.model = get_peft_model(model.talker.model, peft_config)
     
-    # Aktiver text_projection
     if hasattr(model.talker, "text_projection"):
         model.talker.text_projection.requires_grad = True
 
     if accelerator.is_main_process:
         print(f"✅ LoRA aktivert. Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     
-    # Config for dataset
     try:
-        config = AutoConfig.from_pretrained(BASE_MODEL_PATH)
+        config = AutoConfig.from_pretrained(args.init_model_path)
     except:
         config = AutoConfig.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 
-    dataset = NorwegianTTSDataset(TRAIN_JSONL, qwen_wrapper.processor, config)
+    dataset = NorwegianTTSDataset(args.train_jsonl, qwen_wrapper.processor, config)
     dataloader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True, 
+        dataset, batch_size=args.batch_size, shuffle=True, 
         collate_fn=dataset.collate_fn, num_workers=2, pin_memory=True
     )
     
-    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE, weight_decay=0.01)
+    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=0.01)
     
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     
     model.train()
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(args.num_epochs):
         epoch_loss = 0.0
         steps_in_epoch = 0
         
@@ -274,22 +279,18 @@ def train():
 
                 speaker_embedding = model.speaker_encoder(ref_mels).detach()
 
-                # Embedding Logic (NO LANGUAGE HACK)
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                # Tekst: Embedding -> Projection
                 raw_text_embeds = model.talker.model.text_embedding(input_text_ids)
                 projected_text_embeds = model.talker.text_projection(raw_text_embeds)
                 input_text_embedding = projected_text_embeds * text_embedding_mask
 
-                # Codec
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
                 input_codec_embedding[:, 6, :] = speaker_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
-                # Forward Pass
                 outputs = model.talker(
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
@@ -305,13 +306,12 @@ def train():
                 epoch_loss += loss.item()
                 steps_in_epoch += 1
         
-        # Log & Save
         avg_loss = epoch_loss / steps_in_epoch if steps_in_epoch > 0 else 0
         if accelerator.is_main_process:
-            print(f"📊 Epoch {epoch+1}/{NUM_EPOCHS} | Loss: {avg_loss:.4f}")
+            print(f"📊 Epoch {epoch+1}/{args.num_epochs} | Loss: {avg_loss:.4f}")
             
-            if (epoch + 1) % SAVE_EVERY == 0:
-                save_path = os.path.join(OUTPUT_DIR, f"epoch-{epoch+1}")
+            if (epoch + 1) % args.save_every == 0:
+                save_path = os.path.join(args.output_model_path, f"epoch-{epoch+1}")
                 os.makedirs(save_path, exist_ok=True)
                 
                 unwrapped_model = accelerator.unwrap_model(model)
@@ -323,7 +323,8 @@ def train():
                         os.path.join(save_path, "text_projection.bin")
                     )
                 
-                unwrapped_model.config.save_pretrained(save_path)
+                # --- BUG FIX: Do NOT try to save base model config here ---
+                # unwrapped_model.config.save_pretrained(save_path) 
                 
                 readme_lines = [
                     "---",
@@ -345,7 +346,7 @@ def train():
                     try:
                         hf_api.upload_folder(
                             folder_path=save_path,
-                            repo_id=HF_REPO_ID,
+                            repo_id=args.hf_repo_id,
                             path_in_repo=f"checkpoints/epoch_{epoch+1}",
                             repo_type="model"
                         )
