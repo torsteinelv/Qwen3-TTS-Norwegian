@@ -115,7 +115,7 @@ fi
 
 # --- 5. TRAINING (LORA MODE) ---
 echo "[5/6] Starter LoRA-trening..."
-echo "   - Script: /workspace/src/train_lora_complete.py"
+echo "   - Script: /workspace/src/train_lora_complete_new.py"
 echo "   - Batch Size: $BATCH_SIZE"
 echo "   - LR: $LEARNING_RATE"
 echo "   - Epochs: $NUM_EPOCHS"
