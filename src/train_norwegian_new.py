@@ -45,7 +45,7 @@ except ImportError:
 
 
 # ==========================================
-# 1. DATASET (Med German Hijack)
+# 1. DATASET (Med German Hijack + Robust Path Fix)
 # ==========================================
 class NorwegianTTSDataset(Dataset):
     def __init__(self, jsonl_path, processor, target_lang_id):
@@ -73,7 +73,18 @@ class NorwegianTTSDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.items[idx]
-        ref_audio = self._load_audio(item["ref_audio_path"])
+        
+        # --- FIX: Sjekk både 'ref_audio' og 'ref_audio_path' ---
+        path = item.get("ref_audio") or item.get("ref_audio_path")
+        
+        if not path:
+            # Hvis vi ikke finner stien, print en advarsel og ta neste element
+            # Dette hindrer krasj hvis en linje er ødelagt
+            print(f"⚠️ Mangler lydsti på indeks {idx}. Keys: {item.keys()}")
+            # Hack: Returner neste element i stedet (rekursivt)
+            return self.__getitem__((idx + 1) % len(self.items))
+
+        ref_audio = self._load_audio(path)
         
         return {
             "text": item["text"],
@@ -93,9 +104,11 @@ class NorwegianTTSDataset(Dataset):
         
         assistant_ids = []
         for ids in input_ids:
+            # Finn EOS-token
             eos_idx = (ids == 151645).nonzero(as_tuple=True)[0]
             split_idx = eos_idx[0].item() if len(eos_idx) > 0 else 3
             
+            # Lim inn \nassistant\n struktur
             new_ids = torch.cat([
                 ids[:split_idx],
                 torch.tensor([198, 10380, 12114, 3727, 198]),
