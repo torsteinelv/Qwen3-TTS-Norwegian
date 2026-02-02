@@ -120,7 +120,7 @@ accelerate launch --num_processes 1 /workspace/src/train_norwegian_new.py \
   --train_jsonl "$CODES_JSONL" \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output/run_long \
-  --batch_size 7 \
+  --batch_size 6 \
   --num_epochs 100
 
 echo "✅ JOBB FERDIG!"
