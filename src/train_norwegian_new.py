@@ -7,14 +7,15 @@ Løser de 4 kritiske problemene:
 1. ✅ Utvider språkembedding-tabellen med "Norwegian"
 2. ✅ Gjør språkembedding trenbar
 3. ✅ Bruker riktig språkkode ("Norwegian")
-4. ✅ Genererer audio_codes med offisiell tokenizer
+4. ✅ Bruker riktig codec-tokenizer (allerede generert i prepare_data.py)
 
 Bruk:
-  python train_norwegian.py \
-    --train_jsonl ./data/norwegian_data.jsonl \
-    --output_dir ./qwen3-tts-norwegian-lora \
-    --num_epochs 50 \
-    --batch_size 2
+  accelerate launch train_norwegian_new.py \
+    --train_jsonl ./data/train_with_codes.jsonl \
+    --init_model_path ./base_model \
+    --output_model_path ./output/run_long \
+    --batch_size 4 \
+    --num_epochs 100
 """
 
 import argparse
@@ -27,10 +28,9 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from accelerate import Accelerator
 from peft import LoraConfig, get_peft_model
-from safetensors.torch import save_file
 
 # Installer først: git clone https://github.com/QwenLM/Qwen3-TTS && cd Qwen3-TTS && pip install -e "."
-from qwen3_tts import Qwen3TTSModel, Qwen3TTSTokenizer
+from qwen3_tts import Qwen3TTSModel
 
 
 # ==========================================
@@ -79,11 +79,10 @@ def extend_language_embedding(model):
 
 
 # ==========================================
-# 2. DATASET MED RIKTIG CODEC-KODING
+# 2. DATASET (bruker allerede genererte audio_codes fra prepare_data.py)
 # ==========================================
 class NorwegianTTSDataset(Dataset):
-    def __init__(self, jsonl_path, tokenizer, processor):
-        self.tokenizer = tokenizer
+    def __init__(self, jsonl_path, processor):
         self.processor = processor
         
         # Last data
@@ -96,7 +95,7 @@ class NorwegianTTSDataset(Dataset):
         if len(self.items) > 0:
             item = self.items[0]
             assert "text" in item, "Mangler 'text' i JSONL"
-            assert "audio_path" in item, "Mangler 'audio_path' i JSONL"
+            assert "audio_codes" in item, "Mangler 'audio_codes' i JSONL (kjør prepare_data.py først!)"
             assert "ref_audio_path" in item, "Mangler 'ref_audio_path' i JSONL"
     
     def __len__(self):
@@ -111,16 +110,12 @@ class NorwegianTTSDataset(Dataset):
     def __getitem__(self, idx):
         item = self.items[idx]
         
-        # Last og kode lyd til tokens [T, 16]
-        audio = self._load_audio(item["audio_path"])
-        audio_codes = self.tokenizer.encode(audio)  # Dette er KRITISK – bruker riktig codec
-        
         # Last referanselyd
         ref_audio = self._load_audio(item["ref_audio_path"])
         
         return {
             "text": item["text"],
-            "audio_codes": audio_codes.numpy(),  # [T, 16]
+            "audio_codes": np.array(item["audio_codes"], dtype=np.int64),  # [T, 16]
             "ref_audio": ref_audio,
             "language": "Norwegian"  # EKSACT dette navnet!
         }
@@ -203,7 +198,8 @@ class NorwegianTTSDataset(Dataset):
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_jsonl", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="./qwen3-tts-norwegian-lora")
+    parser.add_argument("--init_model_path", type=str, required=True)
+    parser.add_argument("--output_model_path", type=str, default="./qwen3-tts-norwegian-lora")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-5)  # Lav LR for stabilitet
     parser.add_argument("--num_epochs", type=int, default=50)
@@ -215,16 +211,16 @@ def train():
         gradient_accumulation_steps=4,
         mixed_precision="bf16",
         log_with="tensorboard",
-        project_dir=args.output_dir
+        project_dir=args.output_model_path
     )
     
     if accelerator.is_main_process:
-        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(args.output_model_path, exist_ok=True)
         print("🚀 Starter norsk TTS-trening med utvidet språkembedding")
     
     # Last modell
     model = Qwen3TTSModel.from_pretrained(
-        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        args.init_model_path,
         torch_dtype=torch.bfloat16,
         device_map={"": accelerator.device},
         attn_implementation="flash_attention_2" if torch.cuda.is_available() else None
@@ -232,9 +228,6 @@ def train():
     
     # ✅ KRITISK TRINN 1: Utvid språkembedding med norsk
     model = extend_language_embedding(model)
-    
-    # Last tokenizer for codec-koding
-    tokenizer = Qwen3TTSTokenizer.from_pretrained("Qwen/Qwen3-TTS-Tokenizer-12Hz")
     
     # ✅ KRITISK TRINN 2: FRYS alt unntatt LoRA + språkembedding + text_projection
     model.model.requires_grad_(False)
@@ -265,10 +258,9 @@ def train():
         total_params = sum(p.numel() for p in model.model.parameters())
         print(f"   - Total trenbare: {total_trainable:,} / {total_params:,} ({total_trainable/total_params*100:.2f}%)")
     
-    # Datasett
+    # Datasett (bruker allerede genererte audio_codes)
     dataset = NorwegianTTSDataset(
         jsonl_path=args.train_jsonl,
-        tokenizer=tokenizer,
         processor=model.processor
     )
     dataloader = DataLoader(
@@ -358,7 +350,7 @@ def train():
             
             # Lagre hver 5. epoke
             if (epoch + 1) % args.save_every == 0:
-                save_path = os.path.join(args.output_dir, f"epoch-{epoch+1}")
+                save_path = os.path.join(args.output_model_path, f"epoch-{epoch+1}")
                 os.makedirs(save_path, exist_ok=True)
                 
                 # Lagre LoRA
@@ -377,9 +369,9 @@ def train():
                 # Lagre config
                 accelerator.unwrap_model(model).model.config.save_pretrained(save_path)
                 
-                # README
+                # ✅ FIX: Bruk ENKLE anførselstegn (''') for å unngå syntax error med """
                 with open(os.path.join(save_path, "README.md"), "w", encoding="utf-8") as f:
-                    f.write(f"""---
+                    f.write(f'''---
 base_model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
 library_name: peft
 tags:
