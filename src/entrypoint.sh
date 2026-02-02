@@ -121,6 +121,6 @@ accelerate launch --num_processes 1 /workspace/src/train_norwegian_new.py \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output/run_long \
   --batch_size 6 \
-  --num_epochs 100
+  --num_epochs 10
 
 echo "✅ JOBB FERDIG!"
