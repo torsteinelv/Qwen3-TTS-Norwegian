@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Qwen3-TTS Norwegian Fine-Tuning (German Hijack + Robust Data Collator)
-=======================================================================
+Qwen3-TTS Norwegian Fine-Tuning (German Hijack + Robust Data + HF Upload)
+=========================================================================
 
-Fixes:
-1. ValueError (Batch Size Mismatch): Uses the correct complex collate_fn 
-   to align text and audio sequences perfectly.
-2. KeyError: Robust checking for 'ref_audio' vs 'ref_audio_path'.
-3. German Hijack: Injects 'German' language ID to force Germanic prosody.
+1. Ingen 'language_embedding' (unngår AttributeError).
+2. 'German Hijack' (bruker tysk ID for norsk uttale).
+3. Robust Collate_fn (hindrer Shape Mismatch/ValueError).
+4. AUTO-UPLOAD til Hugging Face etter lagring.
 
 Bruk:
   accelerate launch src/train_norwegian_new.py \
@@ -15,7 +14,8 @@ Bruk:
     --init_model_path ./base_model \
     --output_model_path ./output/run_long \
     --batch_size 4 \
-    --num_epochs 100
+    --num_epochs 100 \
+    --hf_repo_id DITT_BRUKERNAVN/DITT_REPO
 """
 
 import argparse
@@ -31,6 +31,7 @@ from torch.optim import AdamW
 from accelerate import Accelerator
 from peft import LoraConfig, get_peft_model
 from transformers import AutoConfig
+from huggingface_hub import HfApi
 
 # ==========================================
 # 0. IMPORT FIX
@@ -44,10 +45,9 @@ except ImportError:
     sys.exit(1)
 
 # ==========================================
-# 1. DATASET & COMPLEX COLLATOR (FIXES VALUE ERROR)
+# 1. DATASET & ROBUST COLLATOR
 # ==========================================
 AudioLike = Union[str, np.ndarray, Tuple[np.ndarray, int]]
-MaybeList = Union[Any, List[Any]]
 
 class NorwegianTTSDataset(Dataset):
     def __init__(self, jsonl_path, processor, config):
@@ -64,7 +64,7 @@ class NorwegianTTSDataset(Dataset):
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         try:
             audio, sr = librosa.load(x, sr=None, mono=True)
-            if len(audio) > 24000 * 15: # Cut max 15s to avoid OOM
+            if len(audio) > 24000 * 15: # Cut max 15s
                 audio = audio[:24000 * 15]
             return audio.astype(np.float32), int(sr)
         except Exception as e:
@@ -92,10 +92,6 @@ class NorwegianTTSDataset(Dataset):
     
     @torch.inference_mode()
     def extract_mels(self, audio, sr):
-        # Må bruke 24kHz for Qwen
-        if sr != 24000:
-            # Enkel resampling hvis nødvendig (men vi antar 24k fra load)
-            pass
         mels = mel_spectrogram(
             torch.from_numpy(audio).unsqueeze(0), 
             n_fft=1024, num_mels=128, sampling_rate=24000,
@@ -120,13 +116,12 @@ class NorwegianTTSDataset(Dataset):
         ref_mel = self.extract_mels(audio=wav, sr=sr)
 
         return {
-            "text_ids": text_ids[:,:-5],    # Fjerner noen slutt-tokens for korrekt fletting
+            "text_ids": text_ids[:,:-5],
             "audio_codes": audio_codes,
             "ref_mel": ref_mel
         }
         
     def collate_fn(self, batch):
-        # Denne komplekse logikken er NØDVENDIG for å unngå ValueError
         item_length = [b['text_ids'].shape[1] + b['audio_codes'].shape[0] for b in batch]
         max_length = max(item_length) + 8
         b, t = len(batch), max_length
@@ -161,7 +156,7 @@ class NorwegianTTSDataset(Dataset):
                 self.config.talker_config.codec_nothink_id,
                 self.config.talker_config.codec_think_bos_id,
                 self.config.talker_config.codec_think_eos_id,
-                0,      # for speaker embedding
+                0, 
                 self.config.talker_config.codec_pad_id        
             ])
             input_ids[i, 8:8+text_ids_len-3, 1] = self.config.talker_config.codec_pad_id
@@ -176,7 +171,7 @@ class NorwegianTTSDataset(Dataset):
             codec_ids[i, 8+text_ids_len-1:8+text_ids_len-1+codec_ids_len, :] = audio_codecs
 
             codec_embedding_mask[i, 3:8+text_ids_len+codec_ids_len] = True
-            codec_embedding_mask[i, 6] = False       # for speaker embedding
+            codec_embedding_mask[i, 6] = False
 
             codec_mask[i, 8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = True
             attention_mask[i, :8+text_ids_len+codec_ids_len] = True
@@ -196,7 +191,7 @@ class NorwegianTTSDataset(Dataset):
         }
 
 # ==========================================
-# 2. TRENING (Med German Hijack)
+# 2. TRENING
 # ==========================================
 def train():
     parser = argparse.ArgumentParser()
@@ -207,6 +202,7 @@ def train():
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--save_every", type=int, default=5)
+    parser.add_argument("--hf_repo_id", type=str, default=os.getenv("HF_REPO_ID"), help="HuggingFace Repo ID")
     args = parser.parse_args()
     
     accelerator = Accelerator(
@@ -218,8 +214,17 @@ def train():
     
     if accelerator.is_main_process:
         os.makedirs(args.output_model_path, exist_ok=True)
-        print("🚀 Starter norsk TTS-trening (German Hijack + Robust Collator)")
+        print("🚀 Starter norsk TTS-trening (Med HF Upload!)")
     
+    # HF Setup
+    hf_api = None
+    if args.hf_repo_id and accelerator.is_main_process:
+        try:
+            hf_api = HfApi()
+            print(f"☁️  HF Upload aktivert til: {args.hf_repo_id}")
+        except Exception as e:
+            print(f"⚠️ Kunne ikke koble til HF: {e}")
+
     # Last modell
     qwen_wrapper = Qwen3TTSModel.from_pretrained(
         args.init_model_path,
@@ -227,17 +232,7 @@ def train():
         device_map={"": accelerator.device},
         attn_implementation="flash_attention_2" if torch.cuda.is_available() else None
     )
-    model = qwen_wrapper.model # Henter den ekte modellen
-    
-    # --- FINN GERMAN ID ---
-    try:
-        lang_list = model.config.talker_config.languages
-        german_id = lang_list.index("German")
-        if accelerator.is_main_process:
-            print(f"✅ Fant 'German' på indeks {german_id}. Hijacker denne!")
-    except:
-        print("⚠️ Fant ikke 'German', bruker ID 2 som fallback.")
-        german_id = 2
+    model = qwen_wrapper.model 
 
     # Frys modell
     model.requires_grad_(False)
@@ -253,7 +248,6 @@ def train():
     # Aktiver text_projection
     if hasattr(model.talker, "text_projection"):
         model.talker.text_projection.requires_grad = True
-        if accelerator.is_main_process: print("✅ Text Projection trenbar.")
 
     if accelerator.is_main_process:
         print(f"✅ LoRA aktivert. Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -274,6 +268,12 @@ def train():
     
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     
+    # FINN GERMAN ID
+    try:
+        german_id = model.config.talker_config.languages.index("German")
+    except:
+        german_id = 2
+
     model.train()
     for epoch in range(args.num_epochs):
         epoch_loss = 0.0
@@ -290,51 +290,34 @@ def train():
                 codec_0_labels = batch['codec_0_labels'].to(model.device)
                 codec_mask = batch['codec_mask'].to(model.device)
 
-                # --- 1. Speaker Embedding ---
                 speaker_embedding = model.speaker_encoder(ref_mels).detach()
 
-                # --- 2. Manuell Embedding-konstruksjon (for Hijack) ---
-                # Splitter input_ids i tekst og codec kanaler
+                # Embedding Logic (Hijack)
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                # Tekst embedding
                 raw_text_embeds = model.talker.model.text_embedding(input_text_ids)
                 projected_text_embeds = model.talker.text_projection(raw_text_embeds)
                 input_text_embedding = projected_text_embeds * text_embedding_mask
 
                 # >>> GERMAN HIJACK START <<<
-                # Vi finner language embedding variabelen
-                lang_embeds = None
                 if hasattr(model.talker, "language_embedding"):
-                    # Lag German ID tensor
                     bs = input_ids.shape[0]
                     g_ids = torch.full((bs,), german_id, dtype=torch.long, device=model.device)
-                    # Hent embedding
                     lang_emb_vec = model.talker.language_embedding(g_ids)
-                    # Legg til tekst-delen (kringkastet til sekvenslengde)
-                    lang_embeds = lang_emb_vec.unsqueeze(1) # [B, 1, D]
-                
-                if lang_embeds is not None:
-                    # Legg German-signalet KUN til der det er tekst (ikke padding/codec)
-                    # text_embedding_mask sikrer at vi ikke ødelegger padding
-                    input_text_embedding = input_text_embedding + (lang_embeds * text_embedding_mask)
+                    input_text_embedding = input_text_embedding + (lang_emb_vec.unsqueeze(1) * text_embedding_mask)
                 # >>> GERMAN HIJACK END <<<
 
-                # Codec embedding
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
                 input_codec_embedding[:, 6, :] = speaker_embedding
 
-                # Kombiner alt
                 input_embeddings = input_text_embedding + input_codec_embedding
 
-                # Legg til AR Codec layers (lag 1-15)
                 for i in range(1, 16):
                     codec_i_emb = model.talker.code_predictor.get_input_embeddings()[i-1](codec_ids[:, :, i])
                     codec_i_emb = codec_i_emb * codec_mask.unsqueeze(-1)
                     input_embeddings = input_embeddings + codec_i_emb
 
-                # --- 3. Forward Pass ---
                 outputs = model.talker(
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
@@ -342,7 +325,6 @@ def train():
                     output_hidden_states=True
                 )
 
-                # Sub-loss calculation
                 hidden_states = outputs.hidden_states[0][-1]
                 talker_hidden_states = hidden_states[codec_mask[:, 1:]]
                 talker_codec_ids = codec_ids[codec_mask]
@@ -357,7 +339,6 @@ def train():
                 epoch_loss += loss.item()
                 steps_in_epoch += 1
         
-        # Logging & Lagring
         avg_loss = epoch_loss / steps_in_epoch if steps_in_epoch > 0 else 0
         if accelerator.is_main_process:
             print(f"📊 Epoch {epoch+1}/{args.num_epochs} | Loss: {avg_loss:.4f}")
@@ -381,7 +362,20 @@ def train():
                 ]
                 with open(os.path.join(save_path, "README.md"), "w", encoding="utf-8") as f:
                     f.write("\n".join(readme_lines))
-                print(f"💾 Checkpoint lagret: {save_path}")
+                print(f"💾 Lagret: {save_path}")
+
+                # --- UPLOAD ---
+                if hf_api:
+                    try:
+                        hf_api.upload_folder(
+                            folder_path=save_path,
+                            repo_id=args.hf_repo_id,
+                            path_in_repo=f"checkpoints/epoch_{epoch+1}",
+                            repo_type="model"
+                        )
+                        print(f"☁️  Lastet opp Epoch {epoch+1} til HF")
+                    except Exception as e:
+                        print(f"⚠️  Feil ved opplasting: {e}")
 
 if __name__ == "__main__":
     train()
