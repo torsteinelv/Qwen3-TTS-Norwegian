@@ -116,7 +116,7 @@ fi
 
 
 # Vi kjører direkte mot filen som start.sh har hentet ned
-accelerate launch --num_processes 1 /workspace/src/train_norwegian_new.py \
+accelerate launch --num_processes 1 /workspace/src/train_norwegian_hack_german.py \
   --train_jsonl "$CODES_JSONL" \
   --init_model_path "$MODEL_LOCAL_DIR" \
   --output_model_path /workspace/output/run_long \
