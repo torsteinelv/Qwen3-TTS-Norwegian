@@ -79,7 +79,6 @@ class NorwegianTTSDataset(Dataset):
             "text": item["text"],
             "audio_codes": np.array(item["audio_codes"], dtype=np.int64),
             "ref_audio": ref_audio,
-            # Vi returnerer ikke strengen "Norwegian", men ID-en direkte i loopen
         }
     
     def collate_fn(self, batch):
@@ -94,11 +93,9 @@ class NorwegianTTSDataset(Dataset):
         
         assistant_ids = []
         for ids in input_ids:
-            # Finn EOS-token
             eos_idx = (ids == 151645).nonzero(as_tuple=True)[0]
             split_idx = eos_idx[0].item() if len(eos_idx) > 0 else 3
             
-            # Lim inn \nassistant\n struktur
             new_ids = torch.cat([
                 ids[:split_idx],
                 torch.tensor([198, 10380, 12114, 3727, 198]),
@@ -169,18 +166,21 @@ def train():
         print("🚀 Starter norsk TTS-trening (Operation German Hijack)")
         print(f"   LR: {args.lr}, Epochs: {args.num_epochs}, Batch: {args.batch_size}")
     
-    # Last modell
-    model = Qwen3TTSModel.from_pretrained(
+    # Last modell-WRAPPER
+    qwen_wrapper = Qwen3TTSModel.from_pretrained(
         args.init_model_path,
         torch_dtype=torch.bfloat16,
         device_map={"": accelerator.device},
         attn_implementation="flash_attention_2" if torch.cuda.is_available() else None
     )
     
+    # VIKTIG: Hent ut selve PyTorch-modellen!
+    model = qwen_wrapper.model 
+    
     # --- FINN GERMAN ID ---
     try:
         # Prøv å hente språklisten fra config
-        lang_list = model.model.config.talker_config.languages
+        lang_list = model.config.talker_config.languages
         german_id = lang_list.index("German")
         if accelerator.is_main_process:
             print(f"✅ Fant 'German' på indeks {german_id}. Hijacker denne for norsk!")
@@ -192,9 +192,9 @@ def train():
         german_id = 2
 
     # Frys modell
-    model.model.requires_grad_(False)
+    model.requires_grad_(False)
     
-    # Aktiver LoRA (Vi stoler på at LoRA fikser alt nå)
+    # Aktiver LoRA
     peft_config = LoraConfig(
         r=16,
         lora_alpha=32,
@@ -203,20 +203,20 @@ def train():
         bias="none",
         task_type="FEATURE_EXTRACTION"
     )
-    model.model.talker.model = get_peft_model(model.model.talker.model, peft_config)
+    model.talker.model = get_peft_model(model.talker.model, peft_config)
     
-    # Prøv å aktivere text_projection hvis den finnes (trygg sjekk)
-    if hasattr(model.model.talker, "text_projection"):
-        model.model.talker.text_projection.requires_grad = True
+    # Prøv å aktivere text_projection hvis den finnes
+    if hasattr(model.talker, "text_projection"):
+        model.talker.text_projection.requires_grad = True
         if accelerator.is_main_process:
             print("✅ Text Projection er aktivert for trening.")
     
     if accelerator.is_main_process:
-        print(f"✅ LoRA aktivert. Params: {sum(p.numel() for p in model.model.parameters() if p.requires_grad):,}")
+        print(f"✅ LoRA aktivert. Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     
     dataset = NorwegianTTSDataset(
         jsonl_path=args.train_jsonl, 
-        processor=model.processor,
+        processor=qwen_wrapper.processor, # Bruk prosessoren fra wrapperen
         target_lang_id=german_id
     )
     dataloader = DataLoader(
@@ -229,7 +229,7 @@ def train():
     )
     
     optimizer = AdamW(
-        filter(lambda p: p.requires_grad, model.model.parameters()),
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
         weight_decay=0.01
     )
@@ -253,38 +253,27 @@ def train():
                 language_ids = torch.full((curr_bs,), german_id, dtype=torch.long, device=model.device)
                 
                 with torch.no_grad():
-                    speaker_embedding = model.model.speaker_encoder(ref_mels).detach()
+                    speaker_embedding = model.speaker_encoder(ref_mels).detach()
                 
-                # Forward Pass (Vi bruker model.model.talker direkte, men vi må gjøre embeddings manuelt for å injecte language ID)
-                # Siden vi ikke vet variabelnavnet for language embedding, stoler vi på at Qwen-biblioteket
-                # håndterer dette hvis vi bare kunne sende language_id. 
-                # MEN: Qwen3-TTS sin 'talker.forward' tar ikke language_ids direkte i standard API.
-                # Derfor må vi gjøre embedding-stegene manuelt slik forrige script gjorde, 
-                # MEN vi bruker try/except for å finne language_embedding laget.
-                
-                talker = model.model.talker
+                # Forward Pass
+                talker = model.talker
                 
                 # 1. Text Embeds
                 text_embeds = talker.model.text_embedding(input_ids)
                 if hasattr(talker, "text_projection"):
                     text_embeds = talker.text_projection(text_embeds)
                 
-                # 2. Language Embeds (LETER ETTER DEN FORSVUNNE VARIABELEN)
-                # Vi prøver vanlige navn. Hvis vi ikke finner den, hopper vi over (LoRA må gjøre jobben alene).
+                # 2. Language Embeds (Leter etter variabelen)
+                # Sjekker vanlige navn i Qwen-modeller
                 if hasattr(talker, "language_embedding"):
                     lang_embeds = talker.language_embedding(language_ids)
                     lang_embeds = lang_embeds.unsqueeze(1).expand(-1, text_embeds.size(1), -1)
                     text_embeds = text_embeds + lang_embeds
-                elif hasattr(talker, "embed_languages"): # Alternativt navn
+                elif hasattr(talker, "embed_languages"):
                     lang_embeds = talker.embed_languages(language_ids)
                     lang_embeds = lang_embeds.unsqueeze(1).expand(-1, text_embeds.size(1), -1)
                     text_embeds = text_embeds + lang_embeds
-                else:
-                    # Hvis vi ikke finner language embedding, er det ingen krise.
-                    # Vi har frosset base-modellen og trener LoRA. 
-                    # LoRA vil lære seg "når input er X, gi output Y" uavhengig av language ID.
-                    pass 
-
+                
                 # 3. Codec Embeds
                 codec_input_ids = torch.full_like(input_ids, 1024)
                 codec_input_ids[:, 0] = 1025
@@ -329,9 +318,10 @@ def train():
                 save_path = os.path.join(args.output_model_path, f"epoch-{epoch+1}")
                 os.makedirs(save_path, exist_ok=True)
                 
+                # Unwrap model for saving
                 unwrapped_model = accelerator.unwrap_model(model)
-                unwrapped_model.model.talker.model.save_pretrained(save_path)
-                unwrapped_model.model.config.save_pretrained(save_path)
+                unwrapped_model.talker.model.save_pretrained(save_path)
+                unwrapped_model.config.save_pretrained(save_path)
                 
                 readme_lines = [
                     "---",
