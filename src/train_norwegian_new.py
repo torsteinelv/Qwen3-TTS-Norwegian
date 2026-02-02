@@ -314,8 +314,10 @@ def train():
                 save_path = os.path.join(args.output_model_path, f"epoch-{epoch+1}")
                 os.makedirs(save_path, exist_ok=True)
                 
+                model.talker.model.save_pretrained(save_path)
+                
+                # For text_projection må vi fortsatt unwrap for å få tak i tensoren
                 unwrapped_model = accelerator.unwrap_model(model)
-                unwrapped_model.talker.model.save_pretrained(save_path)
                 
                 if hasattr(unwrapped_model.talker, "text_projection"):
                      torch.save(
