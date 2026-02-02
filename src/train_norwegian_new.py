@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 """
-Qwen3-TTS Norwegian Fine-Tuning (FIXED SAVE BUG)
-================================================
-Fixes KeyError 'dtype' by removing redundant config saving.
-Includes Auto-Upload to HF every epoch.
-
-Usage:
-  accelerate launch src/train_norwegian_new.py \
-    --train_jsonl ./data/train_with_codes.jsonl \
-    --init_model_path ./base_model \
-    --output_model_path ./output/run_pure_norwegian \
-    --batch_size 4 \
-    --num_epochs 100 \
-    --save_every 1 \
-    --hf_repo_id telvenes/qwen3-tts-norsk-finetune
+Qwen3-TTS Norwegian Fine-Tuning (FINAL FIX)
+===========================================
+1. Fixes static/noise by adding sub-talker loss (codebook 2-16).
+2. Fixes language learning by properly unfreezing text_projection.
+3. Fixes audio stability by forcing 24kHz sampling rate.
 """
 
 import argparse
@@ -39,7 +30,7 @@ try:
     from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
     from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 except ImportError:
-    print("⚠️  Kunne ikke importere Qwen3TTSModel. Sjekk paths.")
+    print("⚠️ Kunne ikke importere Qwen3TTSModel. Sjekk paths.")
     sys.exit(1)
 
 # ==========================================
@@ -61,7 +52,10 @@ class NorwegianTTSDataset(Dataset):
 
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         try:
-            audio, sr = librosa.load(x, sr=None, mono=True)
+            # ENDRING 1: Tving 24000 Hz her. Qwen forventer dette.
+            # sr=None kan gi 44.1k/48k som ødelegger speaker embeddingen.
+            audio, sr = librosa.load(x, sr=24000, mono=True)
+            
             if len(audio) > 24000 * 15: 
                 audio = audio[:24000 * 15]
             return audio.astype(np.float32), int(sr)
@@ -197,9 +191,9 @@ def train():
     parser.add_argument("--init_model_path", type=str, required=True)
     parser.add_argument("--output_model_path", type=str, default="./qwen3-tts-norwegian-lora")
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-5) # Lav LR!
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--save_every", type=int, default=1) # Lagre HVER epoch
+    parser.add_argument("--save_every", type=int, default=1)
     parser.add_argument("--hf_repo_id", type=str, default=os.getenv("HF_REPO_ID"))
     args = parser.parse_args()
     
@@ -212,7 +206,7 @@ def train():
     
     if accelerator.is_main_process:
         os.makedirs(args.output_model_path, exist_ok=True)
-        print("🚀 Starter norsk TTS-trening (Pure LoRA - Fixed Save)")
+        print("🚀 Starter norsk TTS-trening (Med Sub-Talker Loss & Real Unfreeze)")
         print(f"   LR: {args.lr}, Upload hver {args.save_every}. epoch")
     
     # HF Setup
@@ -241,8 +235,11 @@ def train():
     )
     model.talker.model = get_peft_model(model.talker.model, peft_config)
     
+    # ENDRING 2: Korrekt måte å unfreeze text_projection på
     if hasattr(model.talker, "text_projection"):
-        model.talker.text_projection.requires_grad = True
+        print("🔓 Unfreezing text_projection parameters...")
+        for p in model.talker.text_projection.parameters():
+            p.requires_grad = True
 
     if accelerator.is_main_process:
         print(f"✅ LoRA aktivert. Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -276,6 +273,7 @@ def train():
                 codec_embedding_mask = batch['codec_embedding_mask'].to(model.device)
                 attention_mask = batch['attention_mask'].to(model.device)
                 codec_0_labels = batch['codec_0_labels'].to(model.device)
+                codec_mask = batch['codec_mask'].to(model.device)
 
                 speaker_embedding = model.speaker_encoder(ref_mels).detach()
 
@@ -295,10 +293,34 @@ def train():
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
                     labels=codec_0_labels[:, 1:],
-                    output_hidden_states=True
+                    output_hidden_states=True # VIKTIG: Vi trenger hidden states
                 )
 
-                loss = outputs.loss
+                loss_main = outputs.loss
+
+                # ENDRING 3: Sub-Talker Loss for å fikse støy/skurring
+                # Dette trener modellens evne til å generere detaljene i lyden, ikke bare grov-strukturen
+                last_hidden = outputs.hidden_states[-1]
+                
+                # Vi må maskere ut padding og hente relevante codec_ids
+                # Vi kutter siste token (T-1) fordi outputs er shiftet i forward pass
+                active_mask = codec_mask[:, :-1]
+                
+                if active_mask.sum() > 0:
+                    hs = last_hidden[:, :-1][active_mask] # (N, Hidden)
+                    codes = codec_ids[:, :-1, :][active_mask] # (N, 16)
+                    
+                    # Denne funksjonen regner loss på codec groups 2-16
+                    sub_logits, sub_loss = model.talker.forward_sub_talker_finetune(
+                        codec_ids=codes,
+                        talker_hidden_states=hs,
+                    )
+                    
+                    # Total loss = Main Talker + Sub Talker
+                    loss = loss_main + sub_loss
+                else:
+                    loss = loss_main
+
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -316,17 +338,13 @@ def train():
                 
                 model.talker.model.save_pretrained(save_path)
                 
-                # For text_projection må vi fortsatt unwrap for å få tak i tensoren
+                # Lagre text_projection riktig
                 unwrapped_model = accelerator.unwrap_model(model)
-                
                 if hasattr(unwrapped_model.talker, "text_projection"):
                      torch.save(
                         unwrapped_model.talker.text_projection.state_dict(),
                         os.path.join(save_path, "text_projection.bin")
                     )
-                
-                # --- BUG FIX: Do NOT try to save base model config here ---
-                # unwrapped_model.config.save_pretrained(save_path) 
                 
                 readme_lines = [
                     "---",
@@ -334,14 +352,12 @@ def train():
                     "library_name: peft",
                     f"tags: [text-to-speech, norwegian, lora, pure-lora, epoch-{epoch+1}]",
                     "---",
-                    f"# Qwen3-TTS Norwegian (Pure LoRA) - Epoch {epoch+1}",
-                    "",
-                    "## Usage",
-                    "**CRITICAL:** You MUST use a Norwegian reference audio file.",
-                    "No language ID hacks required.",
+                    f"# Qwen3-TTS Norwegian (Final Fix) - Epoch {epoch+1}",
+                    "Includes Sub-Talker Loss training."
                 ]
                 with open(os.path.join(save_path, "README.md"), "w", encoding="utf-8") as f:
                     f.write("\n".join(readme_lines))
+                
                 print(f"💾 Lagret: {save_path}")
 
                 if hf_api:
