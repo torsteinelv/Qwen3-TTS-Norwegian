@@ -242,7 +242,7 @@ def train():
     parser.add_argument("--init_model_path", type=str, required=True)
     parser.add_argument("--output_model_path", type=str, default="./qwen3-tts-norwegian-lora")
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--save_every", type=int, default=1)
     parser.add_argument("--sub_loss_weight", type=float, default=0.25)
