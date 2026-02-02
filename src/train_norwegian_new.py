@@ -1,25 +1,13 @@
 #!/usr/bin/env python3
 """
-Qwen3-TTS Norwegian Fine-Tuning (FINAL PRODUCTION VERSION)
-=========================================================
-
-Features:
-1. Pure LoRA strategy (Best for native pronunciation).
-2. Robust Data Collator (Prevents batch size mismatch).
-3. Bug-fixes applied (Correct method names, no manual codec loops).
-4. Auto-upload to Hugging Face.
-
-Usage:
-  accelerate launch src/train_norwegian_new.py \
-    --train_jsonl ./data/train_with_codes.jsonl \
-    --init_model_path ./base_model \
-    --output_model_path ./output/run_pure_norwegian \
-    --batch_size 4 \
-    --num_epochs 100 \
-    --hf_repo_id DITT_BRUKERNAVN/DITT_REPO
+Qwen3-TTS Norwegian Fine-Tuning (Hardcoded Version)
+===================================================
+Ingen parametere. Ingen tull.
+- Pure LoRA (Ingen German hacks)
+- Robust Data Collator (Ingen krasj)
+- Auto-upload til HF hvert epoch
 """
 
-import argparse
 import json
 import os
 import sys
@@ -33,6 +21,16 @@ from accelerate import Accelerator
 from peft import LoraConfig, get_peft_model
 from transformers import AutoConfig
 from huggingface_hub import HfApi
+
+# --- HARDKODEDE INNSTILLINGER ---
+TRAIN_JSONL = "/workspace/data/train_with_codes.jsonl"
+BASE_MODEL_PATH = "/workspace/base_model"
+OUTPUT_DIR = "/workspace/output/run_pure_norwegian"
+HF_REPO_ID = "telvenes/qwen3-tts-norsk-finetune"  # Endre hvis feil repo
+BATCH_SIZE = 4
+LEARNING_RATE = 1e-5  # Lav LR for norsk finpuss
+NUM_EPOCHS = 100
+SAVE_EVERY = 1        # Lagre og last opp HVER epoch
 
 # ==========================================
 # 0. IMPORT FIX
@@ -192,43 +190,33 @@ class NorwegianTTSDataset(Dataset):
         }
 
 # ==========================================
-# 2. TRENING (Pure LoRA)
+# 2. TRENING (MAIN)
 # ==========================================
 def train():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train_jsonl", type=str, required=True)
-    parser.add_argument("--init_model_path", type=str, required=True)
-    parser.add_argument("--output_model_path", type=str, default="./qwen3-tts-norwegian-lora")
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-5) # Lav LR!
-    parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--save_every", type=int, default=5)
-    parser.add_argument("--hf_repo_id", type=str, default=os.getenv("HF_REPO_ID"))
-    args = parser.parse_args()
-    
     accelerator = Accelerator(
         gradient_accumulation_steps=4,
         mixed_precision="bf16",
         log_with="tensorboard",
-        project_dir=args.output_model_path
+        project_dir=OUTPUT_DIR
     )
     
     if accelerator.is_main_process:
-        os.makedirs(args.output_model_path, exist_ok=True)
-        print("🚀 Starter norsk TTS-trening (Final Correct Version)")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        print("🚀 Starter norsk TTS-trening (Hardcoded Pure LoRA)")
+        print(f"   LR: {LEARNING_RATE}, Upload hver {SAVE_EVERY}. epoch")
     
     # HF Setup
     hf_api = None
-    if args.hf_repo_id and accelerator.is_main_process:
+    if HF_REPO_ID and accelerator.is_main_process:
         try:
             hf_api = HfApi()
-            print(f"☁️  HF Upload aktivert: {args.hf_repo_id}")
+            print(f"☁️  HF Upload aktivert: {HF_REPO_ID}")
         except Exception as e:
             print(f"⚠️  HF Error: {e}")
 
-    # FIX 1: Bruk dtype=torch.bfloat16 (ikke torch_dtype)
+    # Last modell
     qwen_wrapper = Qwen3TTSModel.from_pretrained(
-        args.init_model_path,
+        BASE_MODEL_PATH,
         dtype=torch.bfloat16, 
         device_map={"": accelerator.device},
         attn_implementation="flash_attention_2" if torch.cuda.is_available() else None
@@ -255,22 +243,22 @@ def train():
     
     # Config for dataset
     try:
-        config = AutoConfig.from_pretrained(args.init_model_path)
+        config = AutoConfig.from_pretrained(BASE_MODEL_PATH)
     except:
         config = AutoConfig.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 
-    dataset = NorwegianTTSDataset(args.train_jsonl, qwen_wrapper.processor, config)
+    dataset = NorwegianTTSDataset(TRAIN_JSONL, qwen_wrapper.processor, config)
     dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, 
+        dataset, batch_size=BATCH_SIZE, shuffle=True, 
         collate_fn=dataset.collate_fn, num_workers=2, pin_memory=True
     )
     
-    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE, weight_decay=0.01)
     
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     
     model.train()
-    for epoch in range(args.num_epochs):
+    for epoch in range(NUM_EPOCHS):
         epoch_loss = 0.0
         steps_in_epoch = 0
         
@@ -283,11 +271,10 @@ def train():
                 codec_embedding_mask = batch['codec_embedding_mask'].to(model.device)
                 attention_mask = batch['attention_mask'].to(model.device)
                 codec_0_labels = batch['codec_0_labels'].to(model.device)
-                # codec_mask = batch['codec_mask'].to(model.device) # Trengs kanskje ikke lenger
 
                 speaker_embedding = model.speaker_encoder(ref_mels).detach()
 
-                # Embedding Logic (Simplified & Correct)
+                # Embedding Logic (NO LANGUAGE HACK)
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
@@ -300,13 +287,8 @@ def train():
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
                 input_codec_embedding[:, 6, :] = speaker_embedding
 
-                # Kombiner (uten manuell Codec Loop for AR-lagene, modellen håndterer dette via labels!)
                 input_embeddings = input_text_embedding + input_codec_embedding
 
-                # FIX 3: Fjern den manuelle loopen for get_input_embeddings()
-                # Qwen3-TTS modellen er auto-regressiv. Når vi sender inn labels,
-                # beregner den interne forward-funksjonen loss for alle lagene.
-                
                 # Forward Pass
                 outputs = model.talker(
                     inputs_embeds=input_embeddings[:, :-1, :],
@@ -315,16 +297,7 @@ def train():
                     output_hidden_states=True
                 )
 
-                # FIX 2: Bruk try/except for sub-talker eller sjekk riktig navn
                 loss = outputs.loss
-                sub_talker_loss = 0.0
-                
-                if hasattr(model.talker, "forward_sub_talker"):
-                     # Vi hopper over dette i hoved-loopen for enkelhets skyld hvis det skaper trøbbel,
-                     # men Qwen foreslo å inkludere det. Hvis vi bruker det, må vi ha codec_mask.
-                     # For stabilitet nå: Vi stoler på hoved-loss (outputs.loss).
-                     pass
-
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -335,10 +308,10 @@ def train():
         # Log & Save
         avg_loss = epoch_loss / steps_in_epoch if steps_in_epoch > 0 else 0
         if accelerator.is_main_process:
-            print(f"📊 Epoch {epoch+1}/{args.num_epochs} | Loss: {avg_loss:.4f}")
+            print(f"📊 Epoch {epoch+1}/{NUM_EPOCHS} | Loss: {avg_loss:.4f}")
             
-            if (epoch + 1) % args.save_every == 0:
-                save_path = os.path.join(args.output_model_path, f"epoch-{epoch+1}")
+            if (epoch + 1) % SAVE_EVERY == 0:
+                save_path = os.path.join(OUTPUT_DIR, f"epoch-{epoch+1}")
                 os.makedirs(save_path, exist_ok=True)
                 
                 unwrapped_model = accelerator.unwrap_model(model)
@@ -372,7 +345,7 @@ def train():
                     try:
                         hf_api.upload_folder(
                             folder_path=save_path,
-                            repo_id=args.hf_repo_id,
+                            repo_id=HF_REPO_ID,
                             path_in_repo=f"checkpoints/epoch_{epoch+1}",
                             repo_type="model"
                         )
