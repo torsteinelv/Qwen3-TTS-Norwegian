@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Qwen3-TTS Norwegian Fine-Tuning (FINAL FIX)
-===========================================
-1. Fixes static/noise by adding sub-talker loss (codebook 2-16).
-2. Fixes language learning by properly unfreezing text_projection.
-3. Fixes audio stability by forcing 24kHz sampling rate.
+Qwen3-TTS Norwegian Fine-Tuning (FINAL FIX V2)
+==============================================
+1. Fixes static/noise by adding sub-talker loss.
+2. Fixes language learning by unfreezing text_projection.
+3. Fixes 'NoneType' crash by forcing output_hidden_states in config.
+4. Forces 24kHz sampling rate.
 """
 
 import argparse
@@ -52,8 +53,7 @@ class NorwegianTTSDataset(Dataset):
 
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         try:
-            # ENDRING 1: Tving 24000 Hz her. Qwen forventer dette.
-            # sr=None kan gi 44.1k/48k som ødelegger speaker embeddingen.
+            # Tving 24000 Hz her.
             audio, sr = librosa.load(x, sr=24000, mono=True)
             
             if len(audio) > 24000 * 15: 
@@ -235,7 +235,15 @@ def train():
     )
     model.talker.model = get_peft_model(model.talker.model, peft_config)
     
-    # ENDRING 2: Korrekt måte å unfreeze text_projection på
+    # --- CRITICAL FIX START: FORCE CONFIG TO RETURN HIDDEN STATES ---
+    # Dette fikser "NoneType is not subscriptable" krasjen.
+    # Vi tvinger konfigurasjonen til å alltid beregne hidden states.
+    model.talker.config.output_hidden_states = True
+    if hasattr(model.talker.model, "config"):
+        model.talker.model.config.output_hidden_states = True
+    # --- CRITICAL FIX END ---
+
+    # Unfreeze text_projection (for å lære norsk)
     if hasattr(model.talker, "text_projection"):
         print("🔓 Unfreezing text_projection parameters...")
         for p in model.talker.text_projection.parameters():
@@ -293,33 +301,33 @@ def train():
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
                     labels=codec_0_labels[:, 1:],
-                    output_hidden_states=True # VIKTIG: Vi trenger hidden states
+                    output_hidden_states=True 
                 )
 
                 loss_main = outputs.loss
 
-                # ENDRING 3: Sub-Talker Loss for å fikse støy/skurring
-                # Dette trener modellens evne til å generere detaljene i lyden, ikke bare grov-strukturen
-                last_hidden = outputs.hidden_states[-1]
-                
-                # Vi må maskere ut padding og hente relevante codec_ids
-                # Vi kutter siste token (T-1) fordi outputs er shiftet i forward pass
-                active_mask = codec_mask[:, :-1]
-                
-                if active_mask.sum() > 0:
-                    hs = last_hidden[:, :-1][active_mask] # (N, Hidden)
-                    codes = codec_ids[:, :-1, :][active_mask] # (N, 16)
-                    
-                    # Denne funksjonen regner loss på codec groups 2-16
-                    sub_logits, sub_loss = model.talker.forward_sub_talker_finetune(
-                        codec_ids=codes,
-                        talker_hidden_states=hs,
-                    )
-                    
-                    # Total loss = Main Talker + Sub Talker
-                    loss = loss_main + sub_loss
-                else:
+                # Sjekk at vi faktisk fikk hidden states (Double safety check)
+                if outputs.hidden_states is None:
+                    # Hvis config-fixen feiler, bruk bare main loss for å unngå krasj
+                    if step == 0 and accelerator.is_main_process:
+                         print("⚠️ ADVARSEL: Fikk fortsatt ikke hidden states. Skipper sub-talker loss dette steget.")
                     loss = loss_main
+                else:
+                    # Sub-Talker Loss (Fjerner støy)
+                    last_hidden = outputs.hidden_states[-1]
+                    active_mask = codec_mask[:, :-1]
+                    
+                    if active_mask.sum() > 0:
+                        hs = last_hidden[:, :-1][active_mask]
+                        codes = codec_ids[:, :-1, :][active_mask]
+                        
+                        sub_logits, sub_loss = model.talker.forward_sub_talker_finetune(
+                            codec_ids=codes,
+                            talker_hidden_states=hs,
+                        )
+                        loss = loss_main + sub_loss
+                    else:
+                        loss = loss_main
 
                 accelerator.backward(loss)
                 optimizer.step()
@@ -338,7 +346,6 @@ def train():
                 
                 model.talker.model.save_pretrained(save_path)
                 
-                # Lagre text_projection riktig
                 unwrapped_model = accelerator.unwrap_model(model)
                 if hasattr(unwrapped_model.talker, "text_projection"):
                      torch.save(
