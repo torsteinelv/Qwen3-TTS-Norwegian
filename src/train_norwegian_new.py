@@ -7,10 +7,10 @@ Løser de 4 kritiske problemene:
 1. ✅ Utvider språkembedding-tabellen med "Norwegian"
 2. ✅ Gjør språkembedding trenbar
 3. ✅ Bruker riktig språkkode ("Norwegian")
-4. ✅ Bruker riktig codec-tokenizer (allerede generert i prepare_data.py)
+4. ✅ Bruker riktig codec-tokenizer
 
 Bruk:
-  accelerate launch train_norwegian_new.py \
+  accelerate launch src/train_norwegian_new.py \
     --train_jsonl ./data/train_with_codes.jsonl \
     --init_model_path ./base_model \
     --output_model_path ./output/run_long \
@@ -21,6 +21,7 @@ Bruk:
 import argparse
 import json
 import os
+import sys
 import librosa
 import numpy as np
 import torch
@@ -29,8 +30,17 @@ from torch.optim import AdamW
 from accelerate import Accelerator
 from peft import LoraConfig, get_peft_model
 
-# Installer først: git clone https://github.com/QwenLM/Qwen3-TTS && cd Qwen3-TTS && pip install -e "."
-from qwen3_tts import Qwen3TTSModel
+# ==========================================
+# 0. IMPORT FIX (Peker til Qwen-koden)
+# ==========================================
+# Vi legger til workspace-mappen i path slik at python finner "qwen_tts"
+sys.path.append("/workspace/Qwen3-TTS")
+
+try:
+    from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+except ImportError:
+    print("⚠️  Kunne ikke importere Qwen3TTSModel. Sjekk at mappen '/workspace/Qwen3-TTS' eksisterer.")
+    sys.exit(1)
 
 
 # ==========================================
@@ -55,7 +65,8 @@ def extend_language_embedding(model):
         de_idx = current_languages.index("German")
         en_idx = current_languages.index("English")
     except ValueError:
-        # Fallback: bruk første to språk
+        # Fallback: bruk første to språk hvis tysk/engelsk mangler
+        print("⚠️  Fant ikke Tysk/Engelsk, bruker fallback-initialisering.")
         de_idx, en_idx = 0, 1
     
     # Lag ny embedding som gjennomsnitt
@@ -64,27 +75,25 @@ def extend_language_embedding(model):
     # Utvid vekten
     new_weight = torch.cat([current_weights, new_embedding.unsqueeze(0)], dim=0)
     
-    # Erstatt embedding-laget
+    # Erstatt embedding-laget med det nye
     model.model.talker.language_embedding.weight = torch.nn.Parameter(
         new_weight, 
-        requires_grad=True  # KRITISK: må trenes!
+        requires_grad=True  # KRITISK: må være True for å trenes!
     )
     
     # Oppdater språklista i config
     model.model.config.talker_config.languages.append("Norwegian")
     
-    print(f"✅ Språkembedding utvidet: {len(current_languages)} → {len(model.model.config.talker_config.languages)} språk")
-    print(f"   Språkliste: {model.model.config.talker_config.languages}")
+    print(f"✅ Språkembedding utvidet: {len(current_languages)} -> {len(model.model.config.talker_config.languages)} språk")
     return model
 
 
 # ==========================================
-# 2. DATASET (bruker allerede genererte audio_codes fra prepare_data.py)
+# 2. DATASET
 # ==========================================
 class NorwegianTTSDataset(Dataset):
-    def __init__(self, jsonl_path, processor, language_embedding_size):
+    def __init__(self, jsonl_path, processor):
         self.processor = processor
-        self.language_embedding_size = language_embedding_size
         
         # Last data
         with open(jsonl_path, 'r', encoding='utf-8') as f:
@@ -103,10 +112,16 @@ class NorwegianTTSDataset(Dataset):
         return len(self.items)
     
     def _load_audio(self, path):
-        audio, sr = librosa.load(path, sr=24000, mono=True)
-        if len(audio) > 24000 * 15:  # Maks 15 sek
-            audio = audio[:24000 * 15]
-        return audio
+        # Laster lyd og resampler til 24kHz (Qwen standard)
+        try:
+            audio, sr = librosa.load(path, sr=24000, mono=True)
+            # Kutter hvis den er ekstremt lang for å unngå OOM (maks 15 sek)
+            if len(audio) > 24000 * 15: 
+                audio = audio[:24000 * 15]
+            return audio
+        except Exception as e:
+            print(f"⚠️ Feil ved lasting av lyd {path}: {e}")
+            return np.zeros(24000) # Returner stillhet ved feil
     
     def __getitem__(self, idx):
         item = self.items[idx]
@@ -118,7 +133,7 @@ class NorwegianTTSDataset(Dataset):
             "text": item["text"],
             "audio_codes": np.array(item["audio_codes"], dtype=np.int64),  # [T, 16]
             "ref_audio": ref_audio,
-            "language": "Norwegian"  # EKSACT dette navnet!
+            "language": "Norwegian"
         }
     
     def collate_fn(self, batch):
@@ -134,9 +149,11 @@ class NorwegianTTSDataset(Dataset):
         # Bygg assistant-format (samme som Qwen3-TTS sin internformat)
         assistant_ids = []
         for ids in input_ids:
+            # Finn EOS-token
             eos_idx = (ids == 151645).nonzero(as_tuple=True)[0]
             split_idx = eos_idx[0].item() if len(eos_idx) > 0 else 3
             
+            # Lim inn \nassistant\n struktur
             new_ids = torch.cat([
                 ids[:split_idx],
                 torch.tensor([198, 10380, 12114, 3727, 198]),  # \nassistant\n
@@ -144,7 +161,7 @@ class NorwegianTTSDataset(Dataset):
             ])
             assistant_ids.append(new_ids)
         
-        # Pad
+        # Pad input_ids
         max_len = max(len(ids) for ids in assistant_ids)
         padded_input_ids = torch.full((len(batch), max_len), 151643, dtype=torch.long)  # pad_token_id
         for i, ids in enumerate(assistant_ids):
@@ -160,10 +177,9 @@ class NorwegianTTSDataset(Dataset):
             codec_ids[i, :codes.shape[0]] = codes
             codec_mask[i, :codes.shape[0]] = True
         
-        # Lag mel-spectrogram for referanselyd
+        # Lag mel-spectrogram for referanselyd (til speaker encoder)
         ref_mels = []
         for item in batch:
-            audio_tensor = torch.from_numpy(item["ref_audio"]).unsqueeze(0)
             mel = librosa.feature.melspectrogram(
                 y=item["ref_audio"],
                 sr=24000,
@@ -177,20 +193,12 @@ class NorwegianTTSDataset(Dataset):
             ref_mels.append(mel)
         ref_mels = torch.cat(ref_mels, dim=0)
         
-        # Språk-ID (bruk utvidet lista!)
-        lang_idx = self.processor.tokenizer.languages.index("Norwegian") if hasattr(self.processor.tokenizer, 'languages') else -1
-        if lang_idx == -1:
-            # Fallback: bruk siste indeks (der "Norwegian" ble lagt til)
-            lang_idx = self.language_embedding_size - 1
-        
-        language_ids = torch.full((len(batch),), lang_idx, dtype=torch.long)
-        
         return {
             "input_ids": padded_input_ids,
             "codec_ids": codec_ids,
             "codec_mask": codec_mask,
             "ref_mels": ref_mels,
-            "language_ids": language_ids
+            "language": "Norwegian"
         }
 
 
@@ -203,12 +211,12 @@ def train():
     parser.add_argument("--init_model_path", type=str, required=True)
     parser.add_argument("--output_model_path", type=str, default="./qwen3-tts-norwegian-lora")
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=5e-5)  # Lav LR for stabilitet
-    parser.add_argument("--num_epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--save_every", type=int, default=5)
     args = parser.parse_args()
     
-    # Setup
+    # Setup Accelerator
     accelerator = Accelerator(
         gradient_accumulation_steps=4,
         mixed_precision="bf16",
@@ -219,6 +227,7 @@ def train():
     if accelerator.is_main_process:
         os.makedirs(args.output_model_path, exist_ok=True)
         print("🚀 Starter norsk TTS-trening med utvidet språkembedding")
+        print(f"   LR: {args.lr}, Epochs: {args.num_epochs}, Batch: {args.batch_size}")
     
     # Last modell
     model = Qwen3TTSModel.from_pretrained(
@@ -256,16 +265,11 @@ def train():
         print(f"   - LoRA: {sum(p.numel() for p in model.model.talker.model.parameters() if p.requires_grad):,}")
         print(f"   - Language embedding: {model.model.talker.language_embedding.weight.requires_grad}")
         print(f"   - Text projection: {model.model.talker.text_projection.requires_grad}")
-        total_trainable = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in model.model.parameters())
-        print(f"   - Total trenbare: {total_trainable:,} / {total_params:,} ({total_trainable/total_params*100:.2f}%)")
     
-    # Datasett (bruker allerede genererte audio_codes)
-    original_lang_size = len(model.model.config.talker_config.languages) - 1  # Før utvidelse
+    # Datasett
     dataset = NorwegianTTSDataset(
         jsonl_path=args.train_jsonl,
-        processor=model.processor,
-        language_embedding_size=len(model.model.config.talker_config.languages)
+        processor=model.processor
     )
     dataloader = DataLoader(
         dataset,
@@ -284,10 +288,23 @@ def train():
     
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     
+    # Finn Language ID for "Norwegian" (etter utvidelse)
+    try:
+        # Prøv å finne den i unwrapped modell hvis accelerator har pakket den inn
+        unwrapped = accelerator.unwrap_model(model)
+        norwegian_lang_id = unwrapped.model.config.talker_config.languages.index("Norwegian")
+    except ValueError:
+        print("❌ CRITICAL: Fant ikke 'Norwegian' i språklisten etter utvidelse!")
+        return
+    
+    if accelerator.is_main_process:
+        print(f"🎯 Trener med Language ID: {norwegian_lang_id} (Norwegian)")
+
     # Trening
     model.train()
     for epoch in range(args.num_epochs):
         epoch_loss = 0.0
+        steps_in_epoch = 0
         
         for step, batch in enumerate(dataloader):
             with accelerator.accumulate(model):
@@ -296,7 +313,10 @@ def train():
                 codec_ids = batch["codec_ids"].to(model.device)
                 codec_mask = batch["codec_mask"].to(model.device)
                 ref_mels = batch["ref_mels"].to(model.device, dtype=model.dtype)
-                language_ids = batch["language_ids"].to(model.device)
+                
+                # Sett Language ID manuelt basert på vår "Norwegian" indeks
+                curr_bs = input_ids.shape[0]
+                language_ids = torch.full((curr_bs,), norwegian_lang_id, dtype=torch.long, device=model.device)
                 
                 # Hent speaker embedding
                 with torch.no_grad():
@@ -306,7 +326,7 @@ def train():
                 text_embeds = model.model.talker.model.text_embedding(input_ids)
                 text_embeds = model.model.talker.text_projection(text_embeds)
                 
-                # ✅ KRITISK TRINN 5: Legg til språkembedding
+                # ✅ KRITISK TRINN 5: Legg til språkembedding (Manuell Forward Logic)
                 lang_embeds = model.model.talker.language_embedding(language_ids)
                 lang_embeds = lang_embeds.unsqueeze(1).expand(-1, text_embeds.size(1), -1)
                 text_embeds = text_embeds + lang_embeds
@@ -346,9 +366,10 @@ def train():
                 optimizer.zero_grad()
                 
                 epoch_loss += loss.item()
+                steps_in_epoch += 1
         
         # Logging
-        avg_loss = epoch_loss / len(dataloader)
+        avg_loss = epoch_loss / steps_in_epoch if steps_in_epoch > 0 else 0
         if accelerator.is_main_process:
             print(f"📊 Epoch {epoch+1}/{args.num_epochs} | Loss: {avg_loss:.4f}")
             
@@ -357,24 +378,26 @@ def train():
                 save_path = os.path.join(args.output_model_path, f"epoch-{epoch+1}")
                 os.makedirs(save_path, exist_ok=True)
                 
+                unwrapped_model = accelerator.unwrap_model(model)
+                
                 # Lagre LoRA
-                accelerator.unwrap_model(model).model.talker.model.save_pretrained(save_path)
+                unwrapped_model.model.talker.model.save_pretrained(save_path)
                 
                 # Lagre språkembedding + text_projection
                 torch.save(
-                    accelerator.unwrap_model(model).model.talker.language_embedding.state_dict(),
+                    unwrapped_model.model.talker.language_embedding.state_dict(),
                     os.path.join(save_path, "language_embedding.bin")
                 )
                 torch.save(
-                    accelerator.unwrap_model(model).model.talker.text_projection.state_dict(),
+                    unwrapped_model.model.talker.text_projection.state_dict(),
                     os.path.join(save_path, "text_projection.bin")
                 )
                 
                 # Lagre config
-                accelerator.unwrap_model(model).model.config.save_pretrained(save_path)
+                unwrapped_model.model.config.save_pretrained(save_path)
                 
-                # ✅ FIX: Bruk vanlig streng + .format() for å unngå ALLE syntax errors
-                readme_content = """---
+                # Generer README (FIX: Bruker standard f-string uten trippel quotes for sikkerhet)
+                readme_text = f"""---
 base_model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
 library_name: peft
 tags:
@@ -382,8 +405,9 @@ tags:
 - qwen3-tts
 - norwegian
 - lora
+- epoch-{epoch+1}
 ---
-# Qwen3-TTS Norwegian LoRA (Epoch {epoch})
+# Qwen3-TTS Norwegian LoRA (Epoch {epoch+1})
 
 Trained with extended language embedding for Norwegian.
 
