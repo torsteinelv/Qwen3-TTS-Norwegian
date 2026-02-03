@@ -4,7 +4,7 @@ set -euo pipefail
 # -----------------------------
 # 1) LOGGING
 # -----------------------------
-LOG_FILE="/workspace/output/console_log.txt"
+LOG_FILE="/tmp/console_log.txt"
 mkdir -p /workspace/output
 exec > >(tee -a "$LOG_FILE") 2>&1
 
