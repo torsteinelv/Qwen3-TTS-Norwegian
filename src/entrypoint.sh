@@ -26,7 +26,8 @@ try:
         api.upload_file(
             path_or_fileobj=log_file,
             path_in_repo=f"logs/console_{pod_name}.txt",
-            repo_id=repo
+            repo_id=repo,
+            repo_type="model"
         )
         print("✅ Log uploaded!")
     else:
@@ -44,7 +45,7 @@ FINETUNE_DIR="$REPO_DIR/finetuning"
 DATA_DIR="/workspace/data"
 MODEL_LOCAL_DIR="/workspace/base_model"
 
-# Train params (override via env if you want)
+# Train params (override via env)
 export NUM_EPOCHS=${NUM_EPOCHS:-10}
 export BATCH_SIZE=${BATCH_SIZE:-4}
 export GRAD_ACCUM=${GRAD_ACCUM:-4}
@@ -61,6 +62,7 @@ export TRAIN_MLP_LORA=${TRAIN_MLP_LORA:-false}
 export MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 
 # Dataset toggles
+# Default ON: 1000 hours. Set to 0 to disable.
 export NPSC_HOURS=${NPSC_HOURS:-0}
 
 # ✅ REQUIRED: prepare_data batch size = 16
@@ -80,7 +82,8 @@ echo "🔑 Hugging Face auth (token via env)"
 python3 - << 'PY'
 import os
 assert os.getenv("HF_TOKEN"), "HF_TOKEN missing"
-print("✅ HF token OK")
+assert os.getenv("HF_REPO_ID"), "HF_REPO_ID missing"
+print("✅ HF token/repo OK")
 PY
 
 # --- 4. BASE MODEL ---
@@ -104,7 +107,14 @@ RAW_NPSC="$DATA_DIR/train_raw_npsc.jsonl"
 
 if [ ! -f "$RAW_LIB" ]; then
   echo "📚 Building LibriVox dataset..."
-  python3 /workspace/src/data_nb_librivox.py --out_jsonl "$RAW_LIB"
+  # run builder (assumes it writes train_raw.jsonl in cwd)
+  python3 /workspace/src/data_nb_librivox.py
+  if [ -f "train_raw.jsonl" ]; then
+    mv train_raw.jsonl "$RAW_LIB"
+  elif [ -f "/workspace/train_raw.jsonl" ]; then
+    mv /workspace/train_raw.jsonl "$RAW_LIB"
+  fi
+  test -f "$RAW_LIB" || (echo "❌ LibriVox builder did not produce train_raw.jsonl" && exit 1)
 else
   echo "✅ Found $RAW_LIB"
 fi
@@ -112,7 +122,13 @@ fi
 if [ "$NPSC_HOURS" != "0" ]; then
   if [ ! -f "$RAW_NPSC" ]; then
     echo "🎧 Building NPSC dataset (hours=$NPSC_HOURS)..."
-    python3 /workspace/src/data_nb_npsc.py --out_jsonl "$RAW_NPSC" --hours "$NPSC_HOURS"
+    python3 /workspace/src/data_nb_npsc.py --hours "$NPSC_HOURS" || true
+    if [ -f "train_raw.jsonl" ]; then
+      mv train_raw.jsonl "$RAW_NPSC"
+    elif [ -f "/workspace/train_raw.jsonl" ]; then
+      mv /workspace/train_raw.jsonl "$RAW_NPSC"
+    fi
+    test -f "$RAW_NPSC" || echo "⚠️ NPSC builder did not produce output. Continuing with LibriVox only."
   else
     echo "✅ Found $RAW_NPSC"
   fi
@@ -137,7 +153,7 @@ else
   echo "✅ Found $CODES_LIB"
 fi
 
-if [ "$NPSC_HOURS" != "0" ]; then
+if [ "$NPSC_HOURS" != "0" ] && [ -f "$RAW_NPSC" ]; then
   if [ ! -f "$CODES_NPSC" ]; then
     python3 prepare_data.py \
       --device cuda:0 \
@@ -155,7 +171,7 @@ RUN_DIR="/workspace/output/run_scratch_v1"
 mkdir -p "$RUN_DIR"
 
 TRAIN_JSONL_ARGS="--train_jsonl $CODES_LIB"
-if [ "$NPSC_HOURS" != "0" ]; then
+if [ "$NPSC_HOURS" != "0" ] && [ -f "$CODES_NPSC" ]; then
   TRAIN_JSONL_ARGS="$TRAIN_JSONL_ARGS --train_jsonl $CODES_NPSC"
 fi
 
@@ -163,12 +179,16 @@ echo "RUN_DIR=$RUN_DIR"
 echo "TRAIN_JSONL_ARGS=$TRAIN_JSONL_ARGS"
 echo "PREPARE_BATCH_SIZE=$PREPARE_BATCH_SIZE"
 
-# (Optional) fail fast on syntax before we start
+# fail fast on syntax before we start
 python3 -m py_compile /workspace/src/train_norwegian_scratch_stable.py
 
-accelerate launch --num_processes 1 /workspace/src/train_norwegian_scratch_stable.py \
+accelerate launch \
+  --num_processes 1 \
+  --mixed_precision "$MIXED_PRECISION" \
+  /workspace/src/train_norwegian_scratch_stable.py \
   $TRAIN_JSONL_ARGS \
   --init_model_path "$MODEL_LOCAL_DIR" \
+  --base_model_id "Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
   --output_model_path "$RUN_DIR" \
   --batch_size "$BATCH_SIZE" \
   --grad_accum "$GRAD_ACCUM" \
