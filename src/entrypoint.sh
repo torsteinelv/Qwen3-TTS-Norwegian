@@ -121,17 +121,17 @@ fi
 
 if [ "$NPSC_HOURS" != "0" ]; then
   if [ ! -f "$RAW_NPSC" ]; then
-    echo "🎧 Building NPSC dataset (hours=$NPSC_HOURS)..."
-    python3 /workspace/src/data_nb_npsc.py --hours "$NPSC_HOURS" || true
-    if [ -f "train_raw.jsonl" ]; then
-      mv train_raw.jsonl "$RAW_NPSC"
-    elif [ -f "/workspace/train_raw.jsonl" ]; then
-      mv /workspace/train_raw.jsonl "$RAW_NPSC"
-    fi
-    test -f "$RAW_NPSC" || echo "⚠️ NPSC builder did not produce output. Continuing with LibriVox only."
+    echo "🎧 Building NPSC dataset (max_hours=$NPSC_HOURS)..."
+    python3 /workspace/src/data_nb_npsc.py \
+      --out_jsonl "$RAW_NPSC" \
+      --max_hours "$NPSC_HOURS"
   else
     echo "✅ Found $RAW_NPSC"
   fi
+else
+  echo "ℹ️ NPSC disabled (NPSC_HOURS=0)."
+fi
+
 else
   echo "ℹ️ NPSC disabled (NPSC_HOURS=0)."
 fi
