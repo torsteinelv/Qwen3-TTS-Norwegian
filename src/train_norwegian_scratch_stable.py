@@ -1,30 +1,29 @@
 #!/usr/bin/env python3
 """
-Qwen3-TTS Norwegian Fine-tuning (Scratch/Stable) - V2
+Qwen3-TTS Norwegian Fine-tuning (Scratch/Stable) - V3
 =====================================================
 Fixes:
-- Pads ref_mels in collate_fn (prevents torch.cat/stack crash when mel lengths differ).
+- ref_mels padded in collate_fn (prevents crash when mel lengths differ).
 - PEFT shim: adds prepare_inputs_for_generation if missing (prevents LoRA/PEFT crash).
+- Supports multiple coded jsonl files via repeated --train_jsonl args.
 
-Train:
-  accelerate launch --num_processes 1 train_norwegian_scratch_stable.py \
-    --train_jsonl /workspace/data/train_with_codes_librivox.jsonl \
-    --init_model_path /workspace/base_model \
-    --output_model_path /workspace/output/run_scratch_v1 \
-    --batch_size 4 --grad_accum 4 --num_epochs 10 --save_every 1 \
-    --lora_lr 1e-5 --text_proj_lr 5e-5 --sub_loss_weight 0.2 \
-    --lora_r 4 --lora_alpha 8 --lora_dropout 0.1 --train_mlp_lora false \
-    --mixed_precision bf16 --hf_repo_id telvenes/qwen3-tts-norsk-finetune
-
-Multi-dataset (repeat --train_jsonl):
-  ... --train_jsonl A.jsonl --train_jsonl B.jsonl ...
+Example:
+accelerate launch --num_processes 1 /workspace/src/train_norwegian_scratch_stable.py \
+  --train_jsonl /workspace/data/train_with_codes_librivox.jsonl \
+  --train_jsonl /workspace/data/train_with_codes_npsc.jsonl \
+  --init_model_path /workspace/base_model \
+  --output_model_path /workspace/output/run_scratch_v1 \
+  --batch_size 4 --grad_accum 4 --num_epochs 10 --save_every 1 \
+  --lora_lr 1e-5 --text_proj_lr 5e-5 --sub_loss_weight 0.2 \
+  --lora_r 4 --lora_alpha 8 --lora_dropout 0.1 --train_mlp_lora false \
+  --mixed_precision bf16 --hf_repo_id telvenes/qwen3-tts-norsk-finetune
 """
 
 import argparse
 import json
 import os
 import sys
-from typing import List, Tuple, Union
+from typing import List, Dict, Any
 
 import librosa
 import numpy as np
@@ -43,24 +42,34 @@ sys.path.append("/workspace/Qwen3-TTS")
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 
-AudioLike = Union[str, np.ndarray, Tuple[np.ndarray, int]]
+
+def _str2bool(v: str) -> bool:
+    return str(v).lower() in ("1", "true", "yes", "y", "on")
 
 
 class NorwegianTTSDataset(Dataset):
+    """
+    Expects each line in jsonl to contain:
+      - "text"
+      - "audio_codes"  (list[list[int]] or list of 16-code vectors)
+      - reference audio path in one of: ref_audio/ref_audio_path/audio_path
+    """
     def __init__(
         self,
         jsonl_paths: List[str],
         processor,
         config,
-        max_ref_seconds: float = 12.0,
         max_audio_seconds: float = 15.0,
+        max_ref_seconds: float = 12.0,
+        sr: int = 24000,
     ):
         self.processor = processor
         self.config = config
-        self.max_ref_seconds = float(max_ref_seconds)
         self.max_audio_seconds = float(max_audio_seconds)
+        self.max_ref_seconds = float(max_ref_seconds)
+        self.sr = int(sr)
 
-        self.items = []
+        self.items: List[Dict[str, Any]] = []
         for p in jsonl_paths:
             with open(p, "r", encoding="utf-8") as f:
                 for line in f:
@@ -69,16 +78,13 @@ class NorwegianTTSDataset(Dataset):
                         self.items.append(json.loads(line))
 
         print(f"✅ Lastet {len(self.items)} eksempler fra {len(jsonl_paths)} datasett.")
+        self.max_audio_len = int(self.sr * self.max_audio_seconds)
+
+        # mel frames cap
+        self.max_ref_frames = int(self.max_ref_seconds * self.sr / 256)
 
     def __len__(self) -> int:
         return len(self.items)
-
-    def _load_audio(self, path: str) -> np.ndarray:
-        audio, _sr = librosa.load(path, sr=24000, mono=True)
-        max_len = int(24000 * self.max_audio_seconds)
-        if len(audio) > max_len:
-            audio = audio[:max_len]
-        return audio.astype(np.float32)
 
     def _build_assistant_text(self, text: str) -> str:
         return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
@@ -90,42 +96,60 @@ class NorwegianTTSDataset(Dataset):
             ids = ids.unsqueeze(0)
         return ids
 
+    def _load_audio(self, path: str) -> np.ndarray:
+        audio, _ = librosa.load(path, sr=self.sr, mono=True)
+        if len(audio) > self.max_audio_len:
+            audio = audio[: self.max_audio_len]
+        return audio.astype(np.float32)
+
     @torch.inference_mode()
     def _mel(self, audio_np: np.ndarray) -> torch.Tensor:
         m = mel_spectrogram(
             torch.from_numpy(audio_np).unsqueeze(0),
             n_fft=1024,
             num_mels=128,
-            sampling_rate=24000,
+            sampling_rate=self.sr,
             hop_size=256,
             win_size=1024,
             fmin=0,
             fmax=12000,
         ).transpose(1, 2)  # (1, T, 128)
+        m = m.squeeze(0)   # (T, 128)
 
-        # Cap length for speaker encoder stability
-        max_frames = int(self.max_ref_seconds * 24000 / 256)
-        if m.shape[1] > max_frames:
-            m = m[:, :max_frames, :]
+        # cap length for stability (speaker encoder)
+        if m.shape[0] > self.max_ref_frames:
+            m = m[: self.max_ref_frames, :]
 
-        return m.squeeze(0)  # (T, 128)
+        return m
 
-    def __getitem__(self, idx: int):
-        # avoid recursion; retry a few times
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        # Robust: try a few times to find valid sample
         for _ in range(8):
             item = self.items[idx]
-            ref_path = item.get("ref_audio") or item.get("ref_audio_path") or item.get("audio_path")
-            text = item.get("text", "")
-            codes = item.get("audio_codes")
 
-            if ref_path and text and codes and os.path.exists(ref_path):
+            ref_path = item.get("ref_audio") or item.get("ref_audio_path") or item.get("audio_path")
+            text = item.get("text", None)
+            codes = item.get("audio_codes", None)
+
+            if (
+                ref_path
+                and isinstance(ref_path, str)
+                and os.path.exists(ref_path)
+                and text
+                and isinstance(text, str)
+                and codes is not None
+            ):
                 text_ids = self._tokenize(self._build_assistant_text(text))[:, :-5]
                 audio_codes = torch.tensor(codes, dtype=torch.long)
 
                 wav = self._load_audio(ref_path)
                 ref_mel = self._mel(wav)  # (Tm, 128)
 
-                return {"text_ids": text_ids, "audio_codes": audio_codes, "ref_mel": ref_mel}
+                return {
+                    "text_ids": text_ids,        # (1, Lt)
+                    "audio_codes": audio_codes,  # (Lc, 16)
+                    "ref_mel": ref_mel,          # (Tm, 128)
+                }
 
             idx = (idx + 1) % len(self.items)
 
@@ -133,8 +157,9 @@ class NorwegianTTSDataset(Dataset):
 
 
 def make_collate_fn(config):
-    def collate_fn(batch):
+    def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         B = len(batch)
+
         item_length = [b["text_ids"].shape[1] + b["audio_codes"].shape[0] for b in batch]
         T = max(item_length) + 8
 
@@ -147,9 +172,9 @@ def make_collate_fn(config):
         codec_0_labels = torch.full((B, T), -100, dtype=torch.long)
 
         for i, data in enumerate(batch):
-            text_ids = data["text_ids"]
-            audio_codes = data["audio_codes"]
-            audio_codec_0 = audio_codes[:, 0]
+            text_ids = data["text_ids"]           # (1, Lt)
+            audio_codes = data["audio_codes"]     # (Lc, 16)
+            audio_codec_0 = audio_codes[:, 0]     # (Lc,)
 
             Lt = text_ids.shape[1]
             Lc = audio_codec_0.shape[0]
@@ -158,10 +183,11 @@ def make_collate_fn(config):
             input_ids[i, :3, 0] = text_ids[0, :3]
             input_ids[i, 3:7, 0] = config.tts_pad_token_id
             input_ids[i, 7, 0] = config.tts_bos_token_id
-            input_ids[i, 8:8 + Lt - 3, 0] = text_ids[0, 3:]
+            input_ids[i, 8 : 8 + Lt - 3, 0] = text_ids[0, 3:]
             input_ids[i, 8 + Lt - 3, 0] = config.tts_eos_token_id
-            input_ids[i, 8 + Lt - 2:8 + Lt + Lc, 0] = config.tts_pad_token_id
-            text_embedding_mask[i, :8 + Lt + Lc] = True
+            input_ids[i, 8 + Lt - 2 : 8 + Lt + Lc, 0] = config.tts_pad_token_id
+
+            text_embedding_mask[i, : 8 + Lt + Lc] = True
 
             # Codec channel
             input_ids[i, 3:8, 1] = torch.tensor(
@@ -174,54 +200,50 @@ def make_collate_fn(config):
                 ],
                 dtype=torch.long,
             )
-            input_ids[i, 8:8 + Lt - 3, 1] = config.talker_config.codec_pad_id
+            input_ids[i, 8 : 8 + Lt - 3, 1] = config.talker_config.codec_pad_id
             input_ids[i, 8 + Lt - 3, 1] = config.talker_config.codec_pad_id
             input_ids[i, 8 + Lt - 2, 1] = config.talker_config.codec_bos_id
-            input_ids[i, 8 + Lt - 1:8 + Lt - 1 + Lc, 1] = audio_codec_0
+            input_ids[i, 8 + Lt - 1 : 8 + Lt - 1 + Lc, 1] = audio_codec_0
             input_ids[i, 8 + Lt - 1 + Lc, 1] = config.talker_config.codec_eos_token_id
 
-            codec_0_labels[i, 8 + Lt - 1:8 + Lt - 1 + Lc] = audio_codec_0
+            codec_0_labels[i, 8 + Lt - 1 : 8 + Lt - 1 + Lc] = audio_codec_0
             codec_0_labels[i, 8 + Lt - 1 + Lc] = config.talker_config.codec_eos_token_id
 
-            codec_ids[i, 8 + Lt - 1:8 + Lt - 1 + Lc, :] = audio_codes
+            codec_ids[i, 8 + Lt - 1 : 8 + Lt - 1 + Lc, :] = audio_codes
 
-            codec_embedding_mask[i, 3:8 + Lt + Lc] = True
+            codec_embedding_mask[i, 3 : 8 + Lt + Lc] = True
             codec_embedding_mask[i, 6] = False  # speaker slot
-            codec_mask[i, 8 + Lt - 1:8 + Lt - 1 + Lc] = True
-            attention_mask[i, :8 + Lt + Lc] = True
+            codec_mask[i, 8 + Lt - 1 : 8 + Lt - 1 + Lc] = True
+            attention_mask[i, : 8 + Lt + Lc] = True
 
-        # ✅ PAD ref_mels so stack won't crash
+        # ✅ PAD ref_mels (time dim) then stack
         ref_mels = [d["ref_mel"] for d in batch]  # each (Tm, 128)
         max_tm = max(m.shape[0] for m in ref_mels)
         padded = []
         for m in ref_mels:
             pad_t = max_tm - m.shape[0]
             if pad_t > 0:
-                m = F.pad(m, (0, 0, 0, pad_t))  # pad time dim at end
+                m = F.pad(m, (0, 0, 0, pad_t))  # pad time
             padded.append(m)
         ref_mels = torch.stack(padded, dim=0)  # (B, Tm, 128)
 
         return {
             "input_ids": input_ids,
+            "codec_ids": codec_ids,
             "ref_mels": ref_mels,
             "attention_mask": attention_mask,
             "text_embedding_mask": text_embedding_mask.unsqueeze(-1),
             "codec_embedding_mask": codec_embedding_mask.unsqueeze(-1),
             "codec_0_labels": codec_0_labels,
-            "codec_ids": codec_ids,
             "codec_mask": codec_mask,
         }
 
     return collate_fn
 
 
-def _str2bool(v: str) -> bool:
-    return str(v).lower() in ("1", "true", "yes", "y", "on")
-
-
-def train():
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train_jsonl", action="append", required=True)
+    ap.add_argument("--train_jsonl", action="append", required=True)  # repeatable
     ap.add_argument("--init_model_path", type=str, required=True)
     ap.add_argument("--output_model_path", type=str, required=True)
 
@@ -242,8 +264,8 @@ def train():
     ap.add_argument("--mixed_precision", type=str, default="bf16")  # bf16/fp16/no
     ap.add_argument("--hf_repo_id", type=str, default=None)
 
-    ap.add_argument("--max_ref_seconds", type=float, default=12.0)
     ap.add_argument("--max_audio_seconds", type=float, default=15.0)
+    ap.add_argument("--max_ref_seconds", type=float, default=12.0)
 
     args = ap.parse_args()
     args.train_mlp_lora = _str2bool(args.train_mlp_lora)
@@ -286,7 +308,6 @@ def train():
         attn_implementation="flash_attention_2" if torch.cuda.is_available() else None,
     )
     model = qwen_wrapper.model
-
     model.requires_grad_(False)
 
     # PEFT shim (some peft versions require this attr)
@@ -297,7 +318,7 @@ def train():
                 kwargs["input_ids"] = input_ids
             return kwargs
 
-        model.talker.model.prepare_inputs_for_generation = _pifg  # type: ignore
+        model.talker.model.prepare_inputs_for_generation = _pifg  # type: ignore[attr-defined]
 
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
     if args.train_mlp_lora:
@@ -313,12 +334,12 @@ def train():
     )
     model.talker.model = get_peft_model(model.talker.model, peft_config)
 
-    # Unfreeze text_projection
+    # Unfreeze text_projection (critical for accent/language)
     if hasattr(model.talker, "text_projection"):
         for p in model.talker.text_projection.parameters():
             p.requires_grad = True
 
-    # Try force hidden states (best effort)
+    # Best-effort hidden states
     try:
         model.talker.config.output_hidden_states = True
     except Exception:
@@ -338,27 +359,27 @@ def train():
         jsonl_paths=args.train_jsonl,
         processor=qwen_wrapper.processor,
         config=cfg,
-        max_ref_seconds=args.max_ref_seconds,
         max_audio_seconds=args.max_audio_seconds,
+        max_ref_seconds=args.max_ref_seconds,
+        sr=24000,
     )
 
-    num_workers = 2
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=2,
         pin_memory=True,
+        persistent_workers=True,
         collate_fn=make_collate_fn(cfg),
-        persistent_workers=(num_workers > 0),
     )
 
-    # param groups: LoRA vs text_projection
+    # Param groups: LoRA vs text_projection
     lora_params, tp_params = [], []
-    for n, p in model.named_parameters():
+    for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if "text_projection" in n:
+        if "text_projection" in name:
             tp_params.append(p)
         else:
             lora_params.append(p)
@@ -445,25 +466,22 @@ def train():
             if hasattr(unwrapped.talker, "text_projection"):
                 torch.save(unwrapped.talker.text_projection.state_dict(), os.path.join(save_path, "text_projection.bin"))
 
+            meta = {
+                "epoch": epoch,
+                "datasets": args.train_jsonl,
+                "lora_lr": args.lora_lr,
+                "text_proj_lr": args.text_proj_lr,
+                "sub_loss_weight": args.sub_loss_weight,
+                "lora_r": args.lora_r,
+                "lora_alpha": args.lora_alpha,
+                "lora_dropout": args.lora_dropout,
+                "train_mlp_lora": args.train_mlp_lora,
+                "mixed_precision": args.mixed_precision,
+                "max_audio_seconds": args.max_audio_seconds,
+                "max_ref_seconds": args.max_ref_seconds,
+            }
             with open(os.path.join(save_path, "train_meta.json"), "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "epoch": epoch,
-                        "datasets": args.train_jsonl,
-                        "lora_lr": args.lora_lr,
-                        "text_proj_lr": args.text_proj_lr,
-                        "sub_loss_weight": args.sub_loss_weight,
-                        "lora_r": args.lora_r,
-                        "lora_alpha": args.lora_alpha,
-                        "lora_dropout": args.lora_dropout,
-                        "train_mlp_lora": args.train_mlp_lora,
-                        "mixed_precision": args.mixed_precision,
-                        "max_ref_seconds": args.max_ref_seconds,
-                        "max_audio_seconds": args.max_audio_seconds,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
+                json.dump(meta, f, ensure_ascii=False, indent=2)
 
             print(f"💾 Lagret: {save_path}")
 
@@ -481,4 +499,4 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    main()
