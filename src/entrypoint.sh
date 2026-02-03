@@ -124,7 +124,8 @@ if [ "$NPSC_HOURS" != "0" ]; then
     echo "🎧 Building NPSC dataset (max_hours=$NPSC_HOURS)..."
     python3 /workspace/src/data_nb_npsc.py \
       --out_jsonl "$RAW_NPSC" \
-      --max_hours "$NPSC_HOURS"
+      --max_hours "$NPSC_HOURS" \
+      --trust_remote_code
   else
     echo "✅ Found $RAW_NPSC"
   fi
