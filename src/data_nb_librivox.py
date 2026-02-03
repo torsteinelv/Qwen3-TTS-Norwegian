@@ -1,115 +1,167 @@
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Build train_raw_librivox.jsonl (Norwegian LibriVox / NB)
+========================================================
+- Writes audio to WAV 24kHz mono (stable for Qwen3-TTS)
+- Outputs JSONL with fields: audio, text, ref_audio, id, dataset
+- Uses unique default output filename to avoid collisions.
+
+Example:
+  python3 src/data_nb_librivox.py \
+    --out_jsonl /workspace/data/train_raw_librivox.jsonl \
+    --out_audio_dir /workspace/data/audio_librivox \
+    --max_hours 12 \
+    --ref_audio_strategy same
+"""
+
+import argparse
 import json
-import csv
-import soundfile as sf
-import librosa
+import os
+import re
+import sys
+from typing import Any, Dict, Optional, Tuple
+
 import numpy as np
-from huggingface_hub import hf_hub_download, login
+import soundfile as sf
 
-# --- KONFIGURASJON ---
-OUTPUT_DIR = "/workspace/data" 
-JSONL_PATH = "train_raw.jsonl"
-TARGET_SPEAKER = "Kathrine Engan"
-# MAX_SAMPLES = 2000  <-- KOMMENTERT UT (Vi vil ha alt!)
-REF_FILENAME = "reference_master.wav"
-REPO_ID = "NbAiLab/nb-librivox"
-TARGET_SR = 24000
+try:
+    from datasets import Audio, load_dataset
+except Exception as e:
+    print("❌ Mangler 'datasets'. Installer: pip install datasets soundfile librosa")
+    raise
 
-def build_librivox_dataset():
-    token = os.getenv("HF_TOKEN")
-    if token:
-        login(token=token)
-        print(f"✅ Logget inn på Hugging Face.")
-    else:
-        print("⚠️ ADVARSEL: HF_TOKEN mangler.")
+try:
+    import librosa
+except Exception:
+    print("❌ Mangler 'librosa'. Installer: pip install librosa")
+    raise
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"📂 Lagrer lydfiler til: {OUTPUT_DIR}")
 
-    print(f"📡 Henter metadata.csv fra {REPO_ID}...")
-    try:
-        meta_local_path = hf_hub_download(
-            repo_id=REPO_ID, 
-            filename="metadata.csv", 
-            repo_type="dataset", 
-            token=token
-        )
-    except Exception as e:
-        print(f"❌ Klarte ikke hente metadata: {e}")
-        return
+TEXT_CANDIDATES = ["text", "sentence", "transcript", "normalized_text", "raw_text"]
 
-    jsonl_data = []
-    count = 0
-    ref_saved = False
-    
-    print(f"🔍 Starter filtrering av CSV for: '{TARGET_SPEAKER}' (Mål: {TARGET_SR}Hz)")
-    print("🚀 KJØRER I FULL-MODUS (Ingen begrensning på antall filer)")
 
-    with open(meta_local_path, mode='r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        
-        for row in reader:
-            # --- FJERNET SPERREN HER ---
-            # if count >= MAX_SAMPLES:
-            #     print(f"🛑 Nådde {MAX_SAMPLES} samples.")
-            #     break
-            # ---------------------------
+def norm_text(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-            speaker_name = row.get('speaker_name', '')
-            if TARGET_SPEAKER.lower() not in str(speaker_name).lower():
+
+def pick_text(ex: Dict[str, Any], preferred: Optional[str] = None) -> Optional[str]:
+    if preferred and preferred in ex and ex[preferred]:
+        return str(ex[preferred])
+    for k in TEXT_CANDIDATES:
+        if k in ex and ex[k]:
+            return str(ex[k])
+    return None
+
+
+def ensure_24k_mono(wav: np.ndarray, sr: int, target_sr: int = 24000) -> Tuple[np.ndarray, int]:
+    if wav.ndim > 1:
+        wav = np.mean(wav, axis=-1)
+    wav = wav.astype(np.float32)
+    if sr != target_sr:
+        wav = librosa.resample(y=wav, orig_sr=int(sr), target_sr=int(target_sr)).astype(np.float32)
+        sr = target_sr
+    # Hard clamp just in case
+    wav = np.clip(wav, -1.0, 1.0)
+    return wav, sr
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--hf_dataset", type=str, default="NbAiLab/nb-librivox")
+    ap.add_argument("--hf_split", type=str, default="train")
+    ap.add_argument("--streaming", action="store_true", help="Stream dataset (for very large sets).")
+    ap.add_argument("--out_jsonl", type=str, default="/workspace/data/train_raw_librivox.jsonl")
+    ap.add_argument("--out_audio_dir", type=str, default="/workspace/data/audio_librivox")
+    ap.add_argument("--max_hours", type=float, default=0.0, help="0 = no limit")
+    ap.add_argument("--max_rows", type=int, default=0, help="0 = no limit")
+    ap.add_argument("--min_seconds", type=float, default=0.6)
+    ap.add_argument("--max_seconds", type=float, default=15.0)
+    ap.add_argument("--text_field", type=str, default=None)
+
+    ap.add_argument("--ref_audio_strategy", type=str, choices=["same", "fixed"], default="same",
+                    help="same=ref_audio=audio (multi-speaker OK). fixed=use one ref for all (single-speaker clone).")
+    ap.add_argument("--fixed_ref_audio", type=str, default=None)
+    ap.add_argument("--skip_existing_wav", action="store_true")
+
+    args = ap.parse_args()
+
+    os.makedirs(os.path.dirname(args.out_jsonl), exist_ok=True)
+    os.makedirs(args.out_audio_dir, exist_ok=True)
+
+    if args.ref_audio_strategy == "fixed" and not args.fixed_ref_audio:
+        print("❌ ref_audio_strategy=fixed krever --fixed_ref_audio")
+        sys.exit(1)
+
+    print(f"📥 Laster dataset: {args.hf_dataset} split={args.hf_split} streaming={args.streaming}")
+    ds = load_dataset(args.hf_dataset, split=args.hf_split, streaming=args.streaming)
+
+    # Hvis ikke streaming: cast audio til 24k for stabil skriving
+    if not args.streaming:
+        try:
+            ds = ds.cast_column("audio", Audio(sampling_rate=24000))
+        except Exception:
+            pass
+
+    total_seconds = 0.0
+    written = 0
+
+    with open(args.out_jsonl, "w", encoding="utf-8") as f:
+        for i, ex in enumerate(ds):
+            if args.max_rows and written >= args.max_rows:
+                break
+            if args.max_hours and (total_seconds / 3600.0) >= args.max_hours:
+                break
+
+            text = pick_text(ex, preferred=args.text_field)
+            if not text:
+                continue
+            text = norm_text(text)
+            if len(text) < 2:
                 continue
 
-            repo_filename = row['file_name']
-            text = row['text']
-
-            try:
-                local_audio_path = hf_hub_download(
-                    repo_id=REPO_ID,
-                    filename=repo_filename,
-                    repo_type="dataset",
-                    token=token
-                )
-                
-                # Resampling til 24kHz
-                audio_array, sr = librosa.load(local_audio_path, sr=TARGET_SR)
-                
-                duration = len(audio_array) / sr
-                if duration < 1.0 or duration > 20.0:
-                    continue
-
-                filename = f"{OUTPUT_DIR}/ke_{count:05d}.wav"
-                sf.write(filename, audio_array, sr)
-
-                ref_path = f"{OUTPUT_DIR}/{REF_FILENAME}"
-                if not ref_saved:
-                    if 4.0 < duration < 10.0:
-                        sf.write(ref_path, audio_array, sr)
-                        ref_saved = True
-                        print(f"✅ MASTER REFERANSE LAGRET (24kHz): {ref_path}")
-                    else:
-                        continue 
-                
-                entry = {
-                    "audio": filename,
-                    "text": text,
-                    "ref_audio": ref_path 
-                }
-                jsonl_data.append(entry)
-                
-                count += 1
-                if count % 50 == 0:
-                    print(f"✅ Prosessert {count} filer...")
-
-            except Exception as e:
-                print(f"⚠️ Feil ved {repo_filename}: {e}")
+            audio_obj = ex.get("audio")
+            if not audio_obj:
                 continue
 
-    print(f"💾 Skriver {len(jsonl_data)} linjer til {JSONL_PATH}...")
-    with open(JSONL_PATH, "w", encoding="utf-8") as f:
-        for line in jsonl_data:
-            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+            wav = audio_obj["array"]
+            sr = int(audio_obj["sampling_rate"])
+            wav, sr = ensure_24k_mono(np.asarray(wav), sr, target_sr=24000)
 
-    print(f"🎉 Dataset ferdig bygget! Totalt {count} filer klar for trening.")
+            dur = float(len(wav)) / float(sr)
+            if dur < args.min_seconds or dur > args.max_seconds:
+                continue
+
+            uid = f"librivox_{written:07d}"
+            wav_path = os.path.join(args.out_audio_dir, f"{uid}.wav")
+
+            if (not args.skip_existing_wav) or (not os.path.exists(wav_path)):
+                sf.write(wav_path, wav, sr)
+
+            ref_audio = wav_path if args.ref_audio_strategy == "same" else args.fixed_ref_audio
+
+            row = {
+                "id": uid,
+                "dataset": "nb-librivox",
+                "audio": wav_path,
+                "text": text,
+                "ref_audio": ref_audio,
+            }
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+            written += 1
+            total_seconds += dur
+
+            if written % 500 == 0:
+                print(f"  ... {written} skrevet | ~{total_seconds/3600.0:.2f} timer")
+
+    print(f"✅ Ferdig: {args.out_jsonl}")
+    print(f"   Rader: {written}")
+    print(f"   Timer: {total_seconds/3600.0:.2f}")
+
 
 if __name__ == "__main__":
-    build_librivox_dataset()
+    main()
