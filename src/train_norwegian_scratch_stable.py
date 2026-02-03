@@ -1,111 +1,158 @@
 #!/usr/bin/env python3
 """
-Qwen3-TTS Norwegian Fine-tuning (Scratch/Stable) - V3
-=====================================================
-Fixes:
-- ref_mels padded in collate_fn (prevents crash when mel lengths differ).
-- PEFT shim: adds prepare_inputs_for_generation if missing (prevents LoRA/PEFT crash).
-- Supports multiple coded jsonl files via repeated --train_jsonl args.
+Norwegian Qwen3-TTS finetune (Scratch / Stable / Upload-safe)
 
-Example:
-accelerate launch --num_processes 1 /workspace/src/train_norwegian_scratch_stable.py \
-  --train_jsonl /workspace/data/train_with_codes_librivox.jsonl \
-  --train_jsonl /workspace/data/train_with_codes_npsc.jsonl \
-  --init_model_path /workspace/base_model \
-  --output_model_path /workspace/output/run_scratch_v1 \
-  --batch_size 4 --grad_accum 4 --num_epochs 10 --save_every 1 \
-  --lora_lr 1e-5 --text_proj_lr 5e-5 --sub_loss_weight 0.2 \
-  --lora_r 4 --lora_alpha 8 --lora_dropout 0.1 --train_mlp_lora false \
-  --mixed_precision bf16 --hf_repo_id telvenes/qwen3-tts-norsk-finetune
+Key fixes:
+- Stable ref_mels: enforce fixed ref length (seconds) + padding safety
+- LoRA + text_projection training with separate LRs
+- Optional Sub-talker loss (best effort; skips if hidden_states missing)
+- HF upload: valid README frontmatter (base_model never empty)
+- Multiple datasets: --train_jsonl can be passed multiple times
 """
 
 import argparse
 import json
 import os
 import sys
-from typing import List, Dict, Any
+import time
+import math
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import librosa
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 
 from accelerate import Accelerator
+from accelerate.utils import set_seed
+
 from transformers import AutoConfig
-from peft import LoraConfig, get_peft_model
 from huggingface_hub import HfApi
 
-# Qwen imports
-sys.path.append("/workspace/Qwen3-TTS")
-from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
-from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+from peft import LoraConfig, get_peft_model
 
 
-def _str2bool(v: str) -> bool:
-    return str(v).lower() in ("1", "true", "yes", "y", "on")
+# -----------------------------
+# Qwen import (repo on disk)
+# -----------------------------
+def _ensure_qwen_import(qwen_path: str):
+    if qwen_path and qwen_path not in sys.path:
+        sys.path.append(qwen_path)
+    try:
+        from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+        from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+        return Qwen3TTSModel, mel_spectrogram
+    except ImportError as e:
+        raise SystemExit(
+            f"Could not import Qwen3-TTS from {qwen_path}. "
+            f"Set --qwen_path correctly. Import error: {e}"
+        )
+
+
+AudioLike = Union[str, np.ndarray, Tuple[np.ndarray, int]]
+
+
+@dataclass
+class TrainMeta:
+    base_model_id: str
+    init_model_path: str
+    train_jsonls: List[str]
+    batch_size: int
+    grad_accum: int
+    num_epochs: int
+    save_every: int
+    lora_lr: float
+    text_proj_lr: float
+    sub_loss_weight: float
+    lora_r: int
+    lora_alpha: int
+    lora_dropout: float
+    train_mlp_lora: bool
+    ref_seconds: float
+    max_audio_seconds: float
+    mixed_precision: str
+    seed: int
 
 
 class NorwegianTTSDataset(Dataset):
-    """
-    Expects each line in jsonl to contain:
-      - "text"
-      - "audio_codes"  (list[list[int]] or list of 16-code vectors)
-      - reference audio path in one of: ref_audio/ref_audio_path/audio_path
-    """
     def __init__(
         self,
         jsonl_paths: List[str],
         processor,
         config,
+        mel_spectrogram_fn,
+        ref_seconds: float = 6.0,
         max_audio_seconds: float = 15.0,
-        max_ref_seconds: float = 12.0,
-        sr: int = 24000,
+        sample_rate: int = 24000,
     ):
         self.processor = processor
         self.config = config
+        self.mel_spectrogram = mel_spectrogram_fn
+        self.ref_seconds = float(ref_seconds)
         self.max_audio_seconds = float(max_audio_seconds)
-        self.max_ref_seconds = float(max_ref_seconds)
-        self.sr = int(sr)
+        self.sr = int(sample_rate)
 
         self.items: List[Dict[str, Any]] = []
         for p in jsonl_paths:
             with open(p, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line:
+                    if not line:
+                        continue
+                    try:
                         self.items.append(json.loads(line))
+                    except Exception:
+                        continue
 
         print(f"✅ Lastet {len(self.items)} eksempler fra {len(jsonl_paths)} datasett.")
-        self.max_audio_len = int(self.sr * self.max_audio_seconds)
 
-        # mel frames cap
-        self.max_ref_frames = int(self.max_ref_seconds * self.sr / 256)
+        self.ref_n = int(self.ref_seconds * self.sr)
+        self.max_n = int(self.max_audio_seconds * self.sr)
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.items)
 
+    def _load_audio(self, path: str) -> np.ndarray:
+        # Force 24kHz, mono
+        audio, _ = librosa.load(path, sr=self.sr, mono=True)
+        if audio is None:
+            return np.zeros(self.sr, dtype=np.float32)
+        audio = audio.astype(np.float32)
+
+        # Hard cap to avoid huge refs
+        if audio.shape[0] > self.max_n:
+            audio = audio[: self.max_n]
+
+        # Make fixed-length ref for stable speaker embedding
+        if audio.shape[0] >= self.ref_n:
+            # random crop for augmentation (helps not overfit)
+            start = np.random.randint(0, audio.shape[0] - self.ref_n + 1)
+            audio = audio[start : start + self.ref_n]
+        else:
+            pad = self.ref_n - audio.shape[0]
+            audio = np.pad(audio, (0, pad), mode="constant")
+
+        return audio
+
     def _build_assistant_text(self, text: str) -> str:
+        # matches your existing formatting
         return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
 
-    def _tokenize(self, text: str) -> torch.Tensor:
-        out = self.processor(text=text, return_tensors="pt", padding=True)
-        ids = out["input_ids"]
-        if ids.dim() == 1:
-            ids = ids.unsqueeze(0)
-        return ids
-
-    def _load_audio(self, path: str) -> np.ndarray:
-        audio, _ = librosa.load(path, sr=self.sr, mono=True)
-        if len(audio) > self.max_audio_len:
-            audio = audio[: self.max_audio_len]
-        return audio.astype(np.float32)
+    def _tokenize_text(self, text: str) -> torch.Tensor:
+        toks = self.processor(text=text, return_tensors="pt", padding=False)
+        input_ids = toks["input_ids"]
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        return input_ids  # (1, T)
 
     @torch.inference_mode()
-    def _mel(self, audio_np: np.ndarray) -> torch.Tensor:
-        m = mel_spectrogram(
-            torch.from_numpy(audio_np).unsqueeze(0),
+    def _extract_mels(self, audio: np.ndarray) -> torch.Tensor:
+        # mel_spectrogram expects torch audio [B, T]
+        wav = torch.from_numpy(audio).unsqueeze(0)  # (1, T)
+        mels = self.mel_spectrogram(
+            wav,
             n_fft=1024,
             num_mels=128,
             sampling_rate=self.sr,
@@ -113,55 +160,70 @@ class NorwegianTTSDataset(Dataset):
             win_size=1024,
             fmin=0,
             fmax=12000,
-        ).transpose(1, 2)  # (1, T, 128)
-        m = m.squeeze(0)   # (T, 128)
-
-        # cap length for stability (speaker encoder)
-        if m.shape[0] > self.max_ref_frames:
-            m = m[: self.max_ref_frames, :]
-
-        return m
+        ).transpose(1, 2)  # (1, Tm, 128)
+        return mels.squeeze(0).contiguous()  # (Tm, 128)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Robust: try a few times to find valid sample
-        for _ in range(8):
-            item = self.items[idx]
+        item = self.items[idx]
 
-            ref_path = item.get("ref_audio") or item.get("ref_audio_path") or item.get("audio_path")
-            text = item.get("text", None)
-            codes = item.get("audio_codes", None)
+        # robust audio path keys
+        ref_path = item.get("ref_audio") or item.get("ref_audio_path") or item.get("audio_path")
+        if not ref_path or not os.path.exists(ref_path):
+            # skip to a nearby sample to avoid crashing dataloader
+            return self.__getitem__((idx + 1) % len(self.items))
 
-            if (
-                ref_path
-                and isinstance(ref_path, str)
-                and os.path.exists(ref_path)
-                and text
-                and isinstance(text, str)
-                and codes is not None
-            ):
-                text_ids = self._tokenize(self._build_assistant_text(text))[:, :-5]
-                audio_codes = torch.tensor(codes, dtype=torch.long)
+        text = item.get("text", "")
+        if not isinstance(text, str) or len(text.strip()) == 0:
+            return self.__getitem__((idx + 1) % len(self.items))
 
-                wav = self._load_audio(ref_path)
-                ref_mel = self._mel(wav)  # (Tm, 128)
+        text = self._build_assistant_text(text.strip())
+        text_ids = self._tokenize_text(text)  # (1, T)
 
-                return {
-                    "text_ids": text_ids,        # (1, Lt)
-                    "audio_codes": audio_codes,  # (Lc, 16)
-                    "ref_mel": ref_mel,          # (Tm, 128)
-                }
+        audio_codes = item.get("audio_codes", None)
+        if audio_codes is None:
+            return self.__getitem__((idx + 1) % len(self.items))
 
-            idx = (idx + 1) % len(self.items)
+        audio_codes_t = torch.tensor(audio_codes, dtype=torch.long)
+        if audio_codes_t.dim() == 1:
+            # attempt reshape (rare)
+            if audio_codes_t.numel() % 16 == 0:
+                audio_codes_t = audio_codes_t.view(-1, 16)
+            else:
+                return self.__getitem__((idx + 1) % len(self.items))
+        if audio_codes_t.shape[-1] != 16:
+            return self.__getitem__((idx + 1) % len(self.items))
 
-        raise RuntimeError("Could not find a valid sample after several retries.")
+        wav = self._load_audio(ref_path)
+        ref_mel = self._extract_mels(wav)  # (Tm, 128)
 
+        # In your earlier code you used text_ids[:,:-5], keep it (avoid trailing tokens)
+        if text_ids.shape[1] > 6:
+            text_ids = text_ids[:, :-5]
 
-def make_collate_fn(config):
-    def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "text_ids": text_ids,           # (1, Ttxt)
+            "audio_codes": audio_codes_t,   # (Tcodec, 16)
+            "ref_mel": ref_mel,             # (Tm, 128)
+        }
+
+    def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # Ensure ref_mel shapes can stack
+        # (Even with fixed ref_seconds, mel frame count can differ by 1-2 due to STFT rounding)
+        ref_mels = [b["ref_mel"] for b in batch]
+        max_tm = max(m.shape[0] for m in ref_mels)
+        ref_mel_padded = []
+        for m in ref_mels:
+            if m.shape[0] < max_tm:
+                pad = max_tm - m.shape[0]
+                m = torch.nn.functional.pad(m, (0, 0, 0, pad))  # pad time
+            ref_mel_padded.append(m)
+        ref_mels = torch.stack(ref_mel_padded, dim=0)  # (B, Tm, 128)
+
+        item_len = [b["text_ids"].shape[1] + b["audio_codes"].shape[0] for b in batch]
+        max_len = max(item_len) + 8
+
         B = len(batch)
-
-        item_length = [b["text_ids"].shape[1] + b["audio_codes"].shape[0] for b in batch]
-        T = max(item_length) + 8
+        T = max_len
 
         input_ids = torch.zeros((B, T, 2), dtype=torch.long)
         codec_ids = torch.zeros((B, T, 16), dtype=torch.long)
@@ -172,65 +234,61 @@ def make_collate_fn(config):
         codec_0_labels = torch.full((B, T), -100, dtype=torch.long)
 
         for i, data in enumerate(batch):
-            text_ids = data["text_ids"]           # (1, Lt)
-            audio_codes = data["audio_codes"]     # (Lc, 16)
-            audio_codec_0 = audio_codes[:, 0]     # (Lc,)
+            text_ids = data["text_ids"]      # (1, Ttxt)
+            codes = data["audio_codes"]      # (Tcodec, 16)
+            codec0 = codes[:, 0]             # (Tcodec,)
 
-            Lt = text_ids.shape[1]
-            Lc = audio_codec_0.shape[0]
+            tlen = text_ids.shape[1]
+            clen = codec0.shape[0]
 
-            # Text channel
+            # ---- text channel (0) ----
             input_ids[i, :3, 0] = text_ids[0, :3]
-            input_ids[i, 3:7, 0] = config.tts_pad_token_id
-            input_ids[i, 7, 0] = config.tts_bos_token_id
-            input_ids[i, 8 : 8 + Lt - 3, 0] = text_ids[0, 3:]
-            input_ids[i, 8 + Lt - 3, 0] = config.tts_eos_token_id
-            input_ids[i, 8 + Lt - 2 : 8 + Lt + Lc, 0] = config.tts_pad_token_id
+            input_ids[i, 3:7, 0] = self.config.tts_pad_token_id
+            input_ids[i, 7, 0] = self.config.tts_bos_token_id
+            input_ids[i, 8 : 8 + tlen - 3, 0] = text_ids[0, 3:]
+            input_ids[i, 8 + tlen - 3, 0] = self.config.tts_eos_token_id
+            input_ids[i, 8 + tlen - 2 : 8 + tlen + clen, 0] = self.config.tts_pad_token_id
 
-            text_embedding_mask[i, : 8 + Lt + Lc] = True
+            text_embedding_mask[i, : 8 + tlen + clen] = True
 
-            # Codec channel
+            # ---- codec channel (1) ----
             input_ids[i, 3:8, 1] = torch.tensor(
                 [
-                    config.talker_config.codec_nothink_id,
-                    config.talker_config.codec_think_bos_id,
-                    config.talker_config.codec_think_eos_id,
+                    self.config.talker_config.codec_nothink_id,
+                    self.config.talker_config.codec_think_bos_id,
+                    self.config.talker_config.codec_think_eos_id,
                     0,
-                    config.talker_config.codec_pad_id,
+                    self.config.talker_config.codec_pad_id,
                 ],
                 dtype=torch.long,
             )
-            input_ids[i, 8 : 8 + Lt - 3, 1] = config.talker_config.codec_pad_id
-            input_ids[i, 8 + Lt - 3, 1] = config.talker_config.codec_pad_id
-            input_ids[i, 8 + Lt - 2, 1] = config.talker_config.codec_bos_id
-            input_ids[i, 8 + Lt - 1 : 8 + Lt - 1 + Lc, 1] = audio_codec_0
-            input_ids[i, 8 + Lt - 1 + Lc, 1] = config.talker_config.codec_eos_token_id
 
-            codec_0_labels[i, 8 + Lt - 1 : 8 + Lt - 1 + Lc] = audio_codec_0
-            codec_0_labels[i, 8 + Lt - 1 + Lc] = config.talker_config.codec_eos_token_id
+            input_ids[i, 8 : 8 + tlen - 3, 1] = self.config.talker_config.codec_pad_id
+            input_ids[i, 8 + tlen - 3, 1] = self.config.talker_config.codec_pad_id
+            input_ids[i, 8 + tlen - 2, 1] = self.config.talker_config.codec_bos_id
 
-            codec_ids[i, 8 + Lt - 1 : 8 + Lt - 1 + Lc, :] = audio_codes
+            # codec tokens
+            start = 8 + tlen - 1
+            input_ids[i, start : start + clen, 1] = codec0
+            input_ids[i, start + clen, 1] = self.config.talker_config.codec_eos_token_id
 
-            codec_embedding_mask[i, 3 : 8 + Lt + Lc] = True
-            codec_embedding_mask[i, 6] = False  # speaker slot
-            codec_mask[i, 8 + Lt - 1 : 8 + Lt - 1 + Lc] = True
-            attention_mask[i, : 8 + Lt + Lc] = True
+            # labels for codec0
+            codec_0_labels[i, start : start + clen] = codec0
+            codec_0_labels[i, start + clen] = self.config.talker_config.codec_eos_token_id
 
-        # ✅ PAD ref_mels (time dim) then stack
-        ref_mels = [d["ref_mel"] for d in batch]  # each (Tm, 128)
-        max_tm = max(m.shape[0] for m in ref_mels)
-        padded = []
-        for m in ref_mels:
-            pad_t = max_tm - m.shape[0]
-            if pad_t > 0:
-                m = F.pad(m, (0, 0, 0, pad_t))  # pad time
-            padded.append(m)
-        ref_mels = torch.stack(padded, dim=0)  # (B, Tm, 128)
+            # full codec ids (all 16 codebooks)
+            codec_ids[i, start : start + clen, :] = codes
+
+            # masks
+            codec_embedding_mask[i, 3 : 8 + tlen + clen] = True
+            codec_embedding_mask[i, 6] = False  # speaker embedding slot
+            codec_mask[i, start : start + clen] = True
+            attention_mask[i, : 8 + tlen + clen] = 1
 
         return {
-            "input_ids": input_ids,
-            "codec_ids": codec_ids,
-            "ref_mels": ref_mels,
+            "input_ids": input_ids,  # (B,T,2)
+            "codec_ids": codec_ids,  # (B,T,16)
+            "ref_mels": ref_mels,    # (B,Tm,128)
             "attention_mask": attention_mask,
             "text_embedding_mask": text_embedding_mask.unsqueeze(-1),
             "codec_embedding_mask": codec_embedding_mask.unsqueeze(-1),
@@ -238,37 +296,65 @@ def make_collate_fn(config):
             "codec_mask": codec_mask,
         }
 
-    return collate_fn
+
+def _make_readme(base_model_id: str, epoch: int) -> str:
+    # HF frontmatter must be valid and base_model must not be empty
+    return "\n".join(
+        [
+            "---",
+            f"base_model: {base_model_id}",
+            "library_name: peft",
+            "license: apache-2.0",
+            "tags:",
+            "  - text-to-speech",
+            "  - norwegian",
+            "  - lora",
+            "  - qwen3-tts",
+            "---",
+            f"# Qwen3-TTS Norwegian LoRA - Epoch {epoch}",
+            "",
+            "This checkpoint contains:",
+            "- adapter_model.safetensors (LoRA adapter)",
+            "- adapter_config.json",
+            "- text_projection.bin (fine-tuned text projection layer)",
+            "",
+        ]
+    ) + "\n"
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train_jsonl", action="append", required=True)  # repeatable
-    ap.add_argument("--init_model_path", type=str, required=True)
-    ap.add_argument("--output_model_path", type=str, required=True)
+def train():
+    p = argparse.ArgumentParser()
+    p.add_argument("--train_jsonl", action="append", required=True, help="Can be repeated: --train_jsonl a --train_jsonl b")
+    p.add_argument("--init_model_path", type=str, required=True)
+    p.add_argument("--base_model_id", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base", help="For README/HF metadata")
+    p.add_argument("--output_model_path", type=str, required=True)
 
-    ap.add_argument("--batch_size", type=int, default=4)
-    ap.add_argument("--grad_accum", type=int, default=4)
-    ap.add_argument("--num_epochs", type=int, default=10)
-    ap.add_argument("--save_every", type=int, default=1)
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--grad_accum", type=int, default=4)
+    p.add_argument("--num_epochs", type=int, default=10)
+    p.add_argument("--save_every", type=int, default=1)
 
-    ap.add_argument("--lora_lr", type=float, default=1e-5)
-    ap.add_argument("--text_proj_lr", type=float, default=5e-5)
-    ap.add_argument("--sub_loss_weight", type=float, default=0.2)
+    p.add_argument("--lora_lr", type=float, default=1e-5)
+    p.add_argument("--text_proj_lr", type=float, default=5e-5)
+    p.add_argument("--sub_loss_weight", type=float, default=0.2)
 
-    ap.add_argument("--lora_r", type=int, default=4)
-    ap.add_argument("--lora_alpha", type=int, default=8)
-    ap.add_argument("--lora_dropout", type=float, default=0.1)
-    ap.add_argument("--train_mlp_lora", type=str, default="false")
+    p.add_argument("--lora_r", type=int, default=4)
+    p.add_argument("--lora_alpha", type=int, default=8)
+    p.add_argument("--lora_dropout", type=float, default=0.1)
+    p.add_argument("--train_mlp_lora", type=str, default="false", help="true/false")
 
-    ap.add_argument("--mixed_precision", type=str, default="bf16")  # bf16/fp16/no
-    ap.add_argument("--hf_repo_id", type=str, default=None)
+    p.add_argument("--ref_seconds", type=float, default=6.0)
+    p.add_argument("--max_audio_seconds", type=float, default=15.0)
 
-    ap.add_argument("--max_audio_seconds", type=float, default=15.0)
-    ap.add_argument("--max_ref_seconds", type=float, default=12.0)
+    p.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
+    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--hf_repo_id", type=str, default=os.getenv("HF_REPO_ID"))
+    p.add_argument("--qwen_path", type=str, default="/workspace/Qwen3-TTS")
 
-    args = ap.parse_args()
-    args.train_mlp_lora = _str2bool(args.train_mlp_lora)
+    args = p.parse_args()
+
+    train_mlp_lora = str(args.train_mlp_lora).lower() in ("1", "true", "yes", "y")
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.grad_accum,
@@ -282,47 +368,53 @@ def main():
         print("🚀 Starter norsk TTS-trening (Scratch / Stable)")
         print(f"   datasets: {args.train_jsonl}")
         print(f"   batch_size={args.batch_size} grad_accum={args.grad_accum} epochs={args.num_epochs}")
-        print(f"   lora_lr={args.lora_lr} text_proj_lr={args.text_proj_lr} sub_loss_weight={args.sub_loss_weight}")
-        print(f"   lora_r={args.lora_r} alpha={args.lora_alpha} dropout={args.lora_dropout} train_mlp_lora={args.train_mlp_lora}")
-        print(f"   mixed_precision={args.mixed_precision}")
+        print(
+            f"   lora_lr={args.lora_lr} text_proj_lr={args.text_proj_lr} sub_loss_weight={args.sub_loss_weight}\n"
+            f"   lora_r={args.lora_r} alpha={args.lora_alpha} dropout={args.lora_dropout} train_mlp_lora={train_mlp_lora}\n"
+            f"   mixed_precision={args.mixed_precision}"
+        )
 
+    set_seed(args.seed)
+
+    # HF
     hf_api = None
     if args.hf_repo_id and accelerator.is_main_process:
         try:
             hf_api = HfApi()
+            hf_api.create_repo(repo_id=args.hf_repo_id, repo_type="model", exist_ok=True)
             print(f"☁️  HF Upload aktivert: {args.hf_repo_id}")
         except Exception as e:
-            print(f"⚠️  HF Upload deaktivert: {e}")
+            print(f"⚠️  HF init error: {e}")
+            hf_api = None
 
-    if args.mixed_precision == "bf16":
-        dtype = torch.bfloat16
-    elif args.mixed_precision == "fp16":
-        dtype = torch.float16
-    else:
-        dtype = torch.float32
+    Qwen3TTSModel, mel_spectrogram_fn = _ensure_qwen_import(args.qwen_path)
 
+    # Load model
     qwen_wrapper = Qwen3TTSModel.from_pretrained(
         args.init_model_path,
-        dtype=dtype,
+        dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32,
         device_map={"": accelerator.device},
         attn_implementation="flash_attention_2" if torch.cuda.is_available() else None,
     )
     model = qwen_wrapper.model
     model.requires_grad_(False)
 
-    # PEFT shim (some peft versions require this attr)
+    # Config used by collator
+    try:
+        cfg = AutoConfig.from_pretrained(args.init_model_path)
+    except Exception:
+        cfg = AutoConfig.from_pretrained(args.base_model_id)
+
+    # PEFT: protect against newer peft expecting prepare_inputs_for_generation
     if not hasattr(model.talker.model, "prepare_inputs_for_generation"):
+        def _dummy_prepare_inputs_for_generation(*_a, **kw):
+            return kw
+        setattr(model.talker.model, "prepare_inputs_for_generation", _dummy_prepare_inputs_for_generation)
 
-        def _pifg(input_ids=None, **kwargs):
-            if input_ids is not None:
-                kwargs["input_ids"] = input_ids
-            return kwargs
-
-        model.talker.model.prepare_inputs_for_generation = _pifg  # type: ignore[attr-defined]
-
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-    if args.train_mlp_lora:
-        target_modules += ["gate_proj", "up_proj", "down_proj"]
+    # LoRA target modules
+    attn_targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    mlp_targets = ["gate_proj", "up_proj", "down_proj"] if train_mlp_lora else []
+    target_modules = attn_targets + mlp_targets
 
     peft_config = LoraConfig(
         r=args.lora_r,
@@ -332,171 +424,198 @@ def main():
         bias="none",
         task_type="FEATURE_EXTRACTION",
     )
+
     model.talker.model = get_peft_model(model.talker.model, peft_config)
 
-    # Unfreeze text_projection (critical for accent/language)
+    # Unfreeze text_projection properly
     if hasattr(model.talker, "text_projection"):
         for p in model.talker.text_projection.parameters():
             p.requires_grad = True
 
-    # Best-effort hidden states
-    try:
-        model.talker.config.output_hidden_states = True
-    except Exception:
-        pass
-    if hasattr(model.talker.model, "config"):
-        try:
-            model.talker.model.config.output_hidden_states = True
-        except Exception:
-            pass
+    # Trainable params report
+    if accelerator.is_main_process:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"✅ Trainable params: {trainable:,}")
 
-    try:
-        cfg = AutoConfig.from_pretrained(args.init_model_path)
-    except Exception:
-        cfg = AutoConfig.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-
+    # Dataset & loader
     ds = NorwegianTTSDataset(
         jsonl_paths=args.train_jsonl,
         processor=qwen_wrapper.processor,
         config=cfg,
+        mel_spectrogram_fn=mel_spectrogram_fn,
+        ref_seconds=args.ref_seconds,
         max_audio_seconds=args.max_audio_seconds,
-        max_ref_seconds=args.max_ref_seconds,
-        sr=24000,
+        sample_rate=24000,
     )
-
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
+        collate_fn=ds.collate_fn,
+        num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=True,
-        collate_fn=make_collate_fn(cfg),
+        persistent_workers=(args.num_workers > 0),
     )
 
-    # Param groups: LoRA vs text_projection
-    lora_params, tp_params = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
+    # Optimizer with param groups (LoRA vs text_projection)
+    lora_params = []
+    tp_params = []
+    for n, p_ in model.named_parameters():
+        if not p_.requires_grad:
             continue
-        if "text_projection" in name:
-            tp_params.append(p)
+        if "text_projection" in n:
+            tp_params.append(p_)
         else:
-            lora_params.append(p)
+            lora_params.append(p_)
 
-    optimizer = AdamW(
+    optim = AdamW(
         [
-            {"params": lora_params, "lr": args.lora_lr, "weight_decay": 0.01},
+            {"params": lora_params, "lr": args.lora_lr, "weight_decay": 0.0},
             {"params": tp_params, "lr": args.text_proj_lr, "weight_decay": 0.0},
-        ]
+        ],
+        betas=(0.9, 0.95),
+        eps=1e-8,
     )
 
-    model, optimizer, dl = accelerator.prepare(model, optimizer, dl)
+    model, optim, dl = accelerator.prepare(model, optim, dl)
     model.train()
 
     global_step = 0
-    for epoch in range(1, args.num_epochs + 1):
+    for epoch in range(args.num_epochs):
+        t0 = time.time()
+        running = 0.0
+        nsteps = 0
+
         for batch in dl:
+            global_step += 1
             with accelerator.accumulate(model):
                 input_ids = batch["input_ids"].to(model.device)
                 codec_ids = batch["codec_ids"].to(model.device)
                 ref_mels = batch["ref_mels"].to(model.device, dtype=model.dtype)
-                text_embedding_mask = batch["text_embedding_mask"].to(model.device)
-                codec_embedding_mask = batch["codec_embedding_mask"].to(model.device)
-                attention_mask = batch["attention_mask"].to(model.device)
-                codec_0_labels = batch["codec_0_labels"].to(model.device)
+
+                text_mask = batch["text_embedding_mask"].to(model.device)
+                codec_mask_embed = batch["codec_embedding_mask"].to(model.device)
+                attn = batch["attention_mask"].to(model.device)
+                labels = batch["codec_0_labels"].to(model.device)
                 codec_mask = batch["codec_mask"].to(model.device)
 
+                # Speaker embedding
                 speaker_embedding = model.speaker_encoder(ref_mels).detach()
 
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                raw_text = model.talker.model.text_embedding(input_text_ids)
-                proj_text = model.talker.text_projection(raw_text)
-                input_text_embedding = proj_text * text_embedding_mask
+                raw_text_embeds = model.talker.model.text_embedding(input_text_ids)
+                proj_text = model.talker.text_projection(raw_text_embeds)
+                text_emb = proj_text * text_mask
 
-                input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-                input_codec_embedding[:, 6, :] = speaker_embedding
+                codec_emb = model.talker.model.codec_embedding(input_codec_ids) * codec_mask_embed
+                codec_emb[:, 6, :] = speaker_embedding  # speaker slot
 
-                input_embeddings = input_text_embedding + input_codec_embedding
+                inputs_embeds = text_emb + codec_emb
 
                 outputs = model.talker(
-                    inputs_embeds=input_embeddings[:, :-1, :],
-                    attention_mask=attention_mask[:, :-1],
-                    labels=codec_0_labels[:, 1:],
+                    inputs_embeds=inputs_embeds[:, :-1, :],
+                    attention_mask=attn[:, :-1],
+                    labels=labels[:, 1:],
                     output_hidden_states=True,
                 )
 
                 loss_main = outputs.loss
                 loss = loss_main
 
-                # Sub-talker (best effort)
-                if args.sub_loss_weight > 0 and getattr(outputs, "hidden_states", None):
-                    last_hidden = outputs.hidden_states[-1]
-                    if last_hidden is not None:
-                        active_mask = codec_mask[:, :-1]
-                        if active_mask.sum() > 0:
-                            hs = last_hidden[:, :-1][active_mask]
-                            codes = codec_ids[:, :-1, :][active_mask]
-                            _, sub_loss = model.talker.forward_sub_talker_finetune(
-                                codec_ids=codes,
-                                talker_hidden_states=hs,
-                            )
-                            loss = loss_main + args.sub_loss_weight * sub_loss
+                # Sub-talker loss best-effort
+                if args.sub_loss_weight > 0 and hasattr(model.talker, "forward_sub_talker_finetune"):
+                    hs_ok = getattr(outputs, "hidden_states", None)
+                    if hs_ok is not None and len(hs_ok) > 0 and hs_ok[-1] is not None:
+                        last_hidden = hs_ok[-1]  # (B, T-1, H)
+                        active_mask = codec_mask[:, :-1]  # (B, T-1)
+                        if active_mask.any():
+                            hs = last_hidden[active_mask]              # (N, H)
+                            codes = codec_ids[:, :-1, :][active_mask]  # (N, 16)
+                            try:
+                                _, sub_loss = model.talker.forward_sub_talker_finetune(
+                                    codec_ids=codes,
+                                    talker_hidden_states=hs,
+                                )
+                                loss = loss_main + args.sub_loss_weight * sub_loss
+                            except Exception:
+                                pass  # keep training on main loss only
 
                 accelerator.backward(loss)
-                optimizer.step()
-                optimizer.zero_grad()
+                optim.step()
+                optim.zero_grad()
 
-                global_step += 1
-                if accelerator.is_main_process and global_step % 25 == 0:
-                    print(f"step={global_step} | loss={loss.detach().item():.4f}")
+            running += float(loss.detach().item())
+            nsteps += 1
+
+            if accelerator.is_main_process and global_step % 25 == 0:
+                avg = running / max(1, nsteps)
+                print(f"step={global_step} | loss={avg:.4f}")
 
         if accelerator.is_main_process:
-            print(f"📊 Epoch {epoch}/{args.num_epochs} done")
+            print(f"📊 Epoch {epoch+1}/{args.num_epochs} done ({time.time()-t0:.1f}s)")
 
-        if accelerator.is_main_process and (epoch % args.save_every == 0):
-            save_path = os.path.join(args.output_model_path, f"epoch-{epoch}")
-            os.makedirs(save_path, exist_ok=True)
+        # Save & upload
+        if (epoch + 1) % args.save_every == 0:
+            if accelerator.is_main_process:
+                save_path = os.path.join(args.output_model_path, f"epoch-{epoch+1}")
+                os.makedirs(save_path, exist_ok=True)
 
-            unwrapped = accelerator.unwrap_model(model)
-            unwrapped.talker.model.save_pretrained(save_path)
+                unwrapped = accelerator.unwrap_model(model)
 
-            if hasattr(unwrapped.talker, "text_projection"):
-                torch.save(unwrapped.talker.text_projection.state_dict(), os.path.join(save_path, "text_projection.bin"))
+                # Save adapter
+                unwrapped.talker.model.save_pretrained(save_path, safe_serialization=True)
 
-            meta = {
-                "epoch": epoch,
-                "datasets": args.train_jsonl,
-                "lora_lr": args.lora_lr,
-                "text_proj_lr": args.text_proj_lr,
-                "sub_loss_weight": args.sub_loss_weight,
-                "lora_r": args.lora_r,
-                "lora_alpha": args.lora_alpha,
-                "lora_dropout": args.lora_dropout,
-                "train_mlp_lora": args.train_mlp_lora,
-                "mixed_precision": args.mixed_precision,
-                "max_audio_seconds": args.max_audio_seconds,
-                "max_ref_seconds": args.max_ref_seconds,
-            }
-            with open(os.path.join(save_path, "train_meta.json"), "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-
-            print(f"💾 Lagret: {save_path}")
-
-            if hf_api and args.hf_repo_id:
-                try:
-                    hf_api.upload_folder(
-                        folder_path=save_path,
-                        repo_id=args.hf_repo_id,
-                        path_in_repo=f"checkpoints/epoch_{epoch}",
-                        repo_type="model",
+                # Save text_projection
+                if hasattr(unwrapped.talker, "text_projection"):
+                    torch.save(
+                        unwrapped.talker.text_projection.state_dict(),
+                        os.path.join(save_path, "text_projection.bin"),
                     )
-                    print("☁️  HF Upload OK")
-                except Exception as e:
-                    print(f"⚠️  HF Upload Feil: {e}")
+
+                # Save meta
+                meta = TrainMeta(
+                    base_model_id=args.base_model_id,
+                    init_model_path=args.init_model_path,
+                    train_jsonls=args.train_jsonl,
+                    batch_size=args.batch_size,
+                    grad_accum=args.grad_accum,
+                    num_epochs=args.num_epochs,
+                    save_every=args.save_every,
+                    lora_lr=args.lora_lr,
+                    text_proj_lr=args.text_proj_lr,
+                    sub_loss_weight=args.sub_loss_weight,
+                    lora_r=args.lora_r,
+                    lora_alpha=args.lora_alpha,
+                    lora_dropout=args.lora_dropout,
+                    train_mlp_lora=train_mlp_lora,
+                    ref_seconds=args.ref_seconds,
+                    max_audio_seconds=args.max_audio_seconds,
+                    mixed_precision=args.mixed_precision,
+                    seed=args.seed,
+                )
+                with open(os.path.join(save_path, "train_meta.json"), "w", encoding="utf-8") as f:
+                    json.dump(asdict(meta), f, indent=2, ensure_ascii=False)
+
+                # HF-safe README
+                with open(os.path.join(save_path, "README.md"), "w", encoding="utf-8") as f:
+                    f.write(_make_readme(args.base_model_id, epoch + 1))
+
+                print(f"💾 Lagret: {save_path}")
+
+                if hf_api and args.hf_repo_id:
+                    try:
+                        hf_api.upload_folder(
+                            folder_path=save_path,
+                            repo_id=args.hf_repo_id,
+                            repo_type="model",
+                            path_in_repo=f"checkpoints/epoch_{epoch+1}",
+                        )
+                        print("☁️  HF Upload OK")
+                    except Exception as e:
+                        print(f"⚠️  HF Upload Feil: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    train()
