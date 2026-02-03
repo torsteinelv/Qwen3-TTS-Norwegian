@@ -138,10 +138,6 @@ else
   echo "ℹ️ NPSC disabled (NPSC_HOURS=0)."
 fi
 
-else
-  echo "ℹ️ NPSC disabled (NPSC_HOURS=0)."
-fi
-
 # --- 6. PREPARE CODES ---
 echo "[4/6] Preparing audio codes..."
 sed -i "s/BATCH_INFER_NUM = 32/BATCH_INFER_NUM = $PREPARE_BATCH_SIZE/g" prepare_data.py
