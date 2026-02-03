@@ -63,7 +63,7 @@ export MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 
 # Dataset toggles
 # Default ON: 1000 hours. Set to 0 to disable.
-export NPSC_HOURS=${NPSC_HOURS:-0}
+export NPSC_HOURS=${NPSC_HOURS:-1000}
 
 # ✅ REQUIRED: prepare_data batch size = 16
 export PREPARE_BATCH_SIZE=16
