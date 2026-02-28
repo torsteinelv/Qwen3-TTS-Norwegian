@@ -1,5 +1,5 @@
 transformers>=4.48.0
-datasets==2.21.0
+datasets==4.6.1
 huggingface_hub
 qwen-tts
 torchvision
